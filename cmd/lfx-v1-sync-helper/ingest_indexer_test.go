@@ -42,6 +42,9 @@ func TestProjectUpdateClearVsOmit(t *testing.T) {
 			"AutoJoinEnabled": false,
 		}},
 		{"typed empty slice", map[string]any{"funding_model": []string{}}, map[string]any{"Model": []any{}}},
+		{"whitespace parent clears", map[string]any{
+			"parent_uid": "  \t", "legal_parent_uid": "\n  ",
+		}, map[string]any{"Parent": "", "LegalParentID": ""}},
 		{"null nullable fields", map[string]any{
 			"funding_model": nil, "formation_date": nil, "entity_dissolution_date": nil,
 		}, map[string]any{"Model": []any{}, "StartDate": "", "ProjectEntityDissolutionDate": ""}},

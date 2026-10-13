@@ -1351,8 +1351,8 @@ func mapV2DataToV1ProjectUpdatePayload(ctx context.Context, data map[string]any)
 			return nil, fmt.Errorf("could not resolve v1 project SFID for parent_uid %s: %w", parentUID, err)
 		}
 		payload.Parent = &parentSFID
-	} else if parentUID, ok := data["parent_uid"].(string); ok {
-		payload.Parent = &parentUID
+	} else if _, ok := data["parent_uid"].(string); ok {
+		payload.Parent = new(string)
 	}
 
 	if legalParentUID, ok := data["legal_parent_uid"].(string); ok && strings.TrimSpace(legalParentUID) != "" {
@@ -1362,8 +1362,8 @@ func mapV2DataToV1ProjectUpdatePayload(ctx context.Context, data map[string]any)
 			return nil, fmt.Errorf("could not resolve v1 project SFID for legal_parent_uid %s: %w", legalParentUID, err)
 		}
 		payload.LegalParentID = &legalParentSFID
-	} else if legalParentUID, ok := data["legal_parent_uid"].(string); ok {
-		payload.LegalParentID = &legalParentUID
+	} else if _, ok := data["legal_parent_uid"].(string); ok {
+		payload.LegalParentID = new(string)
 	}
 
 	return payload, nil
