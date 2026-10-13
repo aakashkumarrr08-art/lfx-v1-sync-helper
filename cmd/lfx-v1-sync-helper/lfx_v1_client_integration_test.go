@@ -103,11 +103,14 @@ func TestCommitteeClientIntegration(t *testing.T) {
 
 	// --- Update ---
 	publicDisabled := false
+	updatedName := "v1-sync-helper integration test committee (updated)"
+	updatedDescription := "Updated by integration test"
+	publicName := "Test Committee Public Name"
 	if err := updateV1Committee(ctx, integrationTestProjectSFID, created.ID, projectServiceCommitteeUpdate{
-		Name:          "v1-sync-helper integration test committee (updated)",
-		Description:   "Updated by integration test",
+		Name:          &updatedName,
+		Description:   &updatedDescription,
 		PublicEnabled: &publicDisabled,
-		PublicName:    "Test Committee Public Name",
+		PublicName:    &publicName,
 	}); err != nil {
 		t.Fatalf("updateV1Committee: %v", err)
 	}

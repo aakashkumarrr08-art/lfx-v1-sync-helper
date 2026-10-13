@@ -5,9 +5,169 @@
 package main
 
 import (
+	"encoding/json"
 	"reflect"
 	"testing"
 )
+
+func assertUpdateJSON(t *testing.T, payload any, want map[string]any) {
+	t.Helper()
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("PATCH body = %s, want %#v", body, want)
+	}
+}
+
+func TestProjectUpdateClearVsOmit(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		data map[string]any
+		want map[string]any
+	}{
+		{"absent fields", map[string]any{}, map[string]any{}},
+		{"empty clears", map[string]any{
+			"description": "", "charter_url": "", "funding_model": []any{},
+			"parent_uid": "", "legal_parent_uid": "", "formation_date": "",
+			"autojoin_enabled": false,
+		}, map[string]any{
+			"Description": "", "CharterURL": "", "Model": []any{},
+			"Parent": "", "LegalParentID": "", "StartDate": "",
+			"AutoJoinEnabled": false,
+		}},
+		{"typed empty slice", map[string]any{"funding_model": []string{}}, map[string]any{"Model": []any{}}},
+		{"null nullable fields", map[string]any{
+			"funding_model": nil, "formation_date": nil, "entity_dissolution_date": nil,
+		}, map[string]any{"Model": []any{}, "StartDate": "", "ProjectEntityDissolutionDate": ""}},
+		{"null and malformed omitted", map[string]any{"description": nil, "funding_model": "wrong"}, map[string]any{}},
+		{"malformed list omitted", map[string]any{"funding_model": []any{42}}, map[string]any{}},
+		{"empty slug cannot clear identifier", map[string]any{"slug": "", "description": ""}, map[string]any{"Description": ""}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			payload, err := mapV2DataToV1ProjectUpdatePayload(t.Context(), tt.data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertUpdateJSON(t, payload, tt.want)
+		})
+	}
+}
+
+func TestCommitteeUpdateClearVsOmit(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		data map[string]any
+		want map[string]any
+	}{
+		{"absent fields", map[string]any{}, map[string]any{}},
+		{"empty clears", map[string]any{
+			"description": "", "website": "", "join_mode": "",
+			"mailing_list_email": "", "chat_channel": "", "sso_group_name": "",
+		}, map[string]any{
+			"Description": "", "CommitteeWebsite": "", "JoinMode": "",
+			"MailingList": "", "ChatChannel": "",
+		}},
+		{"non-empty values", map[string]any{"description": "new", "category": "Newsletter"}, map[string]any{"Description": "new", "Category": "Newsletter"}},
+		{"generated SSO name passes through", map[string]any{"sso_group_name": "project-committee"}, map[string]any{"SSOGroupName": "project-committee"}},
+		{"v2 mailing list key", map[string]any{"mailing_list": "list@example.invalid"}, map[string]any{"MailingList": "list@example.invalid"}},
+		{"null omitted", map[string]any{"description": nil}, map[string]any{}},
+		{"partial payload does not infer clears", map[string]any{
+			"uid": "committee-test-uid", "project_uid": "project-test-uid",
+			"name": "Committee", "category": "Other",
+		}, map[string]any{"Name": "Committee", "Category": "Other"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			assertUpdateJSON(t, mapV2DataToV1CommitteeUpdatePayload(tt.data), tt.want)
+		})
+	}
+}
+
+func TestCommitteeUpdateClearsFromSerializedSnapshot(t *testing.T) {
+	// Match CommitteeBase's JSON tags in committee-service v0.4.26. Build()
+	// marshals the entire resource before publishing the indexer update; its
+	// omitempty fields disappear on clear rather than arriving as empty strings.
+	type committeeSnapshot struct {
+		UID              string  `json:"uid"`
+		ProjectUID       string  `json:"project_uid"`
+		Name             string  `json:"name"`
+		Category         string  `json:"category"`
+		CreatedAt        string  `json:"created_at"`
+		UpdatedAt        string  `json:"updated_at"`
+		EnableVoting     bool    `json:"enable_voting"`
+		SSOGroupEnabled  bool    `json:"sso_group_enabled"`
+		RequiresReview   bool    `json:"requires_review"`
+		Public           bool    `json:"public"`
+		TotalMembers     int     `json:"total_members"`
+		TotalVotingRepos int     `json:"total_voting_repos"`
+		HasMailingList   bool    `json:"has_mailing_list"`
+		Description      string  `json:"description,omitempty"`
+		Website          *string `json:"website,omitempty"`
+		MailingList      *string `json:"mailing_list,omitempty"`
+		ChatChannel      *string `json:"chat_channel,omitempty"`
+		JoinMode         string  `json:"join_mode,omitempty"`
+		SSOGroupName     string  `json:"sso_group_name,omitempty"`
+	}
+	base := committeeSnapshot{
+		UID: "committee-test-uid", ProjectUID: "project-test-uid", Name: "Committee", Category: "Other",
+		CreatedAt: "2026-01-01T00:00:00Z", UpdatedAt: "2026-01-02T00:00:00Z",
+	}
+	for _, tt := range []struct {
+		name string
+		data committeeSnapshot
+		want map[string]any
+	}{
+		{"omitted cleared fields", base, map[string]any{
+			"Name": "Committee", "Category": "Other", "Description": "", "CommitteeWebsite": "",
+			"MailingList": "", "ChatChannel": "", "JoinMode": "",
+		}},
+		{"populated mailing list", func() committeeSnapshot {
+			value := base
+			list := "list@example.invalid"
+			value.MailingList = &list
+			return value
+		}(), map[string]any{
+			"Name": "Committee", "Category": "Other", "Description": "", "CommitteeWebsite": "",
+			"MailingList": "list@example.invalid", "ChatChannel": "", "JoinMode": "",
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			body, err := json.Marshal(struct {
+				Data committeeSnapshot `json:"data"`
+			}{Data: tt.data})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var event indexingEventBody
+			if err := json.Unmarshal(body, &event); err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := event.Data["description"]; ok {
+				t.Fatal("empty description should be omitted by committee-service serialization")
+			}
+			assertUpdateJSON(t, mapV2DataToV1CommitteeUpdatePayload(event.Data), tt.want)
+			for _, missing := range []string{"updated_at", "sso_group_enabled", "total_members", "total_voting_repos", "has_mailing_list"} {
+				trimmed := make(map[string]any, len(event.Data))
+				for key, value := range event.Data {
+					if key != missing {
+						trimmed[key] = value
+					}
+				}
+				// A near-complete but truncated event must not clear absent fields.
+				want := map[string]any{"Name": "Committee", "Category": "Other"}
+				if list, ok := trimmed["mailing_list"].(string); ok {
+					want["MailingList"] = list
+				}
+				assertUpdateJSON(t, mapV2DataToV1CommitteeUpdatePayload(trimmed), want)
+			}
+		})
+	}
+}
 
 func TestResolveOrgIDFromEventData_keepsSFID(t *testing.T) {
 	ctx := t.Context()
@@ -291,30 +451,30 @@ func TestMapV2DataToV1ProjectUpdatePayload_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mapV2DataToV1ProjectUpdatePayload() error = %v", err)
 	}
-	if got.Name != "Renamed Project" {
-		t.Errorf("Name = %q", got.Name)
+	if got.Name == nil || *got.Name != "Renamed Project" {
+		t.Errorf("Name = %v", got.Name)
 	}
-	if got.Slug != "renamed-project" {
-		t.Errorf("Slug = %q", got.Slug)
+	if got.Slug == nil || *got.Slug != "renamed-project" {
+		t.Errorf("Slug = %v", got.Slug)
 	}
-	if got.Status != "Active" {
-		t.Errorf("Status = %q", got.Status)
+	if got.Status == nil || *got.Status != "Active" {
+		t.Errorf("Status = %v", got.Status)
 	}
-	if !reflect.DeepEqual(got.Model, []string{"Membership"}) {
+	if got.Model == nil || !reflect.DeepEqual(*got.Model, []string{"Membership"}) {
 		t.Errorf("Model = %#v", got.Model)
 	}
 	if got.AutoJoinEnabled == nil || *got.AutoJoinEnabled != false {
 		t.Errorf("AutoJoinEnabled = %v, want *false (must send explicit false, not omit)", got.AutoJoinEnabled)
 	}
-	if got.StartDate != "2020-06-01" {
-		t.Errorf("StartDate = %q, want date-only", got.StartDate)
+	if got.StartDate == nil || *got.StartDate != "2020-06-01" {
+		t.Errorf("StartDate = %v, want date-only", got.StartDate)
 	}
-	if got.ProjectEntityDissolutionDate != "" {
-		t.Errorf("ProjectEntityDissolutionDate = %q, want empty (empty input skipped)", got.ProjectEntityDissolutionDate)
+	if got.ProjectEntityDissolutionDate == nil || *got.ProjectEntityDissolutionDate != "" {
+		t.Errorf("ProjectEntityDissolutionDate = %v, want pointer to empty (clear)", got.ProjectEntityDissolutionDate)
 	}
-	// Fields not in input should be zero-valued so PATCH omits them.
-	if got.Category != "" {
-		t.Errorf("Category = %q, want empty (not in input)", got.Category)
+	// Fields not in input should be nil so PATCH omits them.
+	if got.Category != nil {
+		t.Errorf("Category = %v, want nil (not in input)", got.Category)
 	}
 }
 
@@ -346,11 +506,11 @@ func TestMapV2DataToV1ProjectUpdatePayload_IsFoundationSwitchesProjectType(t *te
 	tests := []struct {
 		name        string
 		data        map[string]any
-		wantProject string
+		wantProject *string
 	}{
-		{name: "is_foundation=true → Project Group", data: map[string]any{"is_foundation": true}, wantProject: "Project Group"},
-		{name: "is_foundation=false → Project", data: map[string]any{"is_foundation": false}, wantProject: "Project"},
-		{name: "is_foundation absent → unset", data: map[string]any{}, wantProject: ""},
+		{name: "is_foundation=true → Project Group", data: map[string]any{"is_foundation": true}, wantProject: ptr("Project Group")},
+		{name: "is_foundation=false → Project", data: map[string]any{"is_foundation": false}, wantProject: ptr("Project")},
+		{name: "is_foundation absent → unset", data: map[string]any{}, wantProject: nil},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -358,8 +518,8 @@ func TestMapV2DataToV1ProjectUpdatePayload_IsFoundationSwitchesProjectType(t *te
 			if err != nil {
 				t.Fatalf("mapV2DataToV1ProjectUpdatePayload() error = %v", err)
 			}
-			if got.ProjectType != tt.wantProject {
-				t.Fatalf("ProjectType = %q, want %q", got.ProjectType, tt.wantProject)
+			if !reflect.DeepEqual(got.ProjectType, tt.wantProject) {
+				t.Fatalf("ProjectType = %v, want %v", got.ProjectType, tt.wantProject)
 			}
 		})
 	}

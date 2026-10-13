@@ -698,18 +698,18 @@ type projectServiceCommitteeCreate struct {
 
 // projectServiceCommitteeUpdate is the request body for PATCH /v2/projects/{projectId}/committees/{committeeID}.
 type projectServiceCommitteeUpdate struct {
-	Name            string `json:"Name,omitempty"`
-	Category        string `json:"Category,omitempty"`
-	Description     string `json:"Description,omitempty"`
-	Website         string `json:"CommitteeWebsite,omitempty"`
-	CommitteeID     string `json:"CommitteeID,omitempty"` // parent committee ID if creating a subcommittee
-	SSOGroupEnabled *bool  `json:"SSOGroupEnabled,omitempty"`
-	PublicEnabled   *bool  `json:"PublicEnabled,omitempty"`
-	PublicName      string `json:"PublicName,omitempty"`
-	SSOGroupName    string `json:"SSOGroupName,omitempty"`
-	JoinMode        string `json:"JoinMode,omitempty"`
-	MailingList     string `json:"MailingList,omitempty"`
-	ChatChannel     string `json:"ChatChannel,omitempty"`
+	Name            *string `json:"Name,omitempty"`
+	Category        *string `json:"Category,omitempty"`
+	Description     *string `json:"Description,omitempty"`
+	Website         *string `json:"CommitteeWebsite,omitempty"`
+	CommitteeID     *string `json:"CommitteeID,omitempty"` // parent committee ID if creating a subcommittee
+	SSOGroupEnabled *bool   `json:"SSOGroupEnabled,omitempty"`
+	PublicEnabled   *bool   `json:"PublicEnabled,omitempty"`
+	PublicName      *string `json:"PublicName,omitempty"`
+	SSOGroupName    *string `json:"SSOGroupName,omitempty"`
+	JoinMode        *string `json:"JoinMode,omitempty"`
+	MailingList     *string `json:"MailingList,omitempty"`
+	ChatChannel     *string `json:"ChatChannel,omitempty"`
 }
 
 // projectServiceCommitteeResponse is the response from the project service for creating and updating committees.
@@ -877,28 +877,29 @@ type projectServiceProjectCreate struct {
 }
 
 // projectServiceProjectUpdate is the request body for PATCH /project-service/v1/projects/{sfid}.
-// All fields are optional; unset fields are left untouched on the v1 record.
+// Nil fields are omitted (leave v1 untouched); non-nil empty values are sent
+// explicitly so the v1 PATCH can clear a field.
 type projectServiceProjectUpdate struct {
-	Name                           string   `json:"Name,omitempty"`
-	Slug                           string   `json:"Slug,omitempty"`
-	Description                    string   `json:"Description,omitempty"`
-	Parent                         string   `json:"Parent,omitempty"`
-	ProjectType                    string   `json:"ProjectType,omitempty"` // v2 is_foundation: true→"Project Group", false→"Project"
-	Status                         string   `json:"Status,omitempty"`
-	Category                       string   `json:"Category,omitempty"`
-	EntityName                     string   `json:"EntityName,omitempty"`
-	EntityType                     string   `json:"EntityType,omitempty"`
-	Funding                        string   `json:"Funding,omitempty"`
-	Model                          []string `json:"Model,omitempty"`
-	CharterURL                     string   `json:"CharterURL,omitempty"`
-	AutoJoinEnabled                *bool    `json:"AutoJoinEnabled,omitempty"`
-	StartDate                      string   `json:"StartDate,omitempty"`
-	ProjectLogo                    string   `json:"ProjectLogo,omitempty"`
-	RepositoryURL                  string   `json:"RepositoryURL,omitempty"`
-	Website                        string   `json:"Website,omitempty"`
-	ProjectEntityDissolutionDate   string   `json:"ProjectEntityDissolutionDate,omitempty"`
-	ProjectEntityFormationDocument string   `json:"ProjectEntityFormationDocument,omitempty"`
-	LegalParentID                  string   `json:"LegalParentID,omitempty"`
+	Name                           *string   `json:"Name,omitempty"`
+	Slug                           *string   `json:"Slug,omitempty"`
+	Description                    *string   `json:"Description,omitempty"`
+	Parent                         *string   `json:"Parent,omitempty"`
+	ProjectType                    *string   `json:"ProjectType,omitempty"` // v2 is_foundation: true→"Project Group", false→"Project"
+	Status                         *string   `json:"Status,omitempty"`
+	Category                       *string   `json:"Category,omitempty"`
+	EntityName                     *string   `json:"EntityName,omitempty"`
+	EntityType                     *string   `json:"EntityType,omitempty"`
+	Funding                        *string   `json:"Funding,omitempty"`
+	Model                          *[]string `json:"Model,omitempty"`
+	CharterURL                     *string   `json:"CharterURL,omitempty"`
+	AutoJoinEnabled                *bool     `json:"AutoJoinEnabled,omitempty"`
+	StartDate                      *string   `json:"StartDate,omitempty"`
+	ProjectLogo                    *string   `json:"ProjectLogo,omitempty"`
+	RepositoryURL                  *string   `json:"RepositoryURL,omitempty"`
+	Website                        *string   `json:"Website,omitempty"`
+	ProjectEntityDissolutionDate   *string   `json:"ProjectEntityDissolutionDate,omitempty"`
+	ProjectEntityFormationDocument *string   `json:"ProjectEntityFormationDocument,omitempty"`
+	LegalParentID                  *string   `json:"LegalParentID,omitempty"`
 }
 
 // projectServiceProjectResponse is the relevant subset of the response returned by

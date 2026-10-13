@@ -295,7 +295,7 @@ func handleCommitteeUpdate(ctx context.Context, key string, v1Data map[string]an
 	// Write the v2-generated SSOGroupName back to the v1 project-service so PCC can display it.
 	if v2SSOGroupName != "" && projectSFID != "" {
 		if writeErr := updateV1Committee(ctx, projectSFID, sfid, projectServiceCommitteeUpdate{
-			SSOGroupName: v2SSOGroupName,
+			SSOGroupName: &v2SSOGroupName,
 		}); writeErr != nil {
 			logger.With(errKey, writeErr, "sfid", sfid, "sso_group_name", v2SSOGroupName).WarnContext(ctx, "failed to write SSOGroupName back to v1")
 		} else {
