@@ -428,33 +428,7 @@ func syncCommitteeUpdateToV1(ctx context.Context, committeeUID, projectSFID, com
 		return nil
 	}
 
-	payload := projectServiceCommitteeUpdate{}
-	name, _ := data["name"].(string)
-	if name != "" {
-		payload.Name = name
-	}
-	if category, ok := data["category"].(string); ok {
-		payload.Category = mapV2CategoryToV1(category)
-	}
-	if desc, ok := data["description"].(string); ok {
-		payload.Description = desc
-	}
-	if website, ok := data["website"].(string); ok {
-		payload.Website = website
-	}
-	if joinMode, ok := data["join_mode"].(string); ok {
-		payload.JoinMode = joinMode
-	}
-	if mailingListEmail, ok := data["mailing_list_email"].(string); ok {
-		payload.MailingList = mailingListEmail
-	}
-	if chatChannel, ok := data["chat_channel"].(string); ok {
-		payload.ChatChannel = chatChannel
-	}
-	if ssoGroupName, ok := data["sso_group_name"].(string); ok && ssoGroupName != "" {
-		payload.SSOGroupName = ssoGroupName
-	}
-
+	payload := mapV2DataToV1CommitteeUpdatePayload(data)
 	if err := updateV1Committee(ctx, projectSFID, committeeSFID, payload); err != nil {
 		log.With(errKey, err).ErrorContext(ctx, "failed to update committee in v1")
 		return err // transient: trigger redeliver
@@ -462,6 +436,75 @@ func syncCommitteeUpdateToV1(ctx context.Context, committeeUID, projectSFID, com
 
 	log.InfoContext(ctx, "successfully updated committee in v1 from indexer event")
 	return nil
+}
+
+// mapV2DataToV1CommitteeUpdatePayload preserves the distinction between an
+// absent field and an explicitly empty value in the indexer event.
+func mapV2DataToV1CommitteeUpdatePayload(data map[string]any) projectServiceCommitteeUpdate {
+	payload := projectServiceCommitteeUpdate{}
+	// Committee-service v0.4.26 publishes the entire CommitteeBase on updates,
+	// but omitempty drops cleared optional fields before they reach the indexer.
+	// Require both identity and non-optional metadata from that contract before
+	// inferring a clear from absence; do not clear fields on partial/legacy bodies.
+	uid, _ := data["uid"].(string)
+	projectUID, _ := data["project_uid"].(string)
+	_, hasName := data["name"].(string)
+	_, hasCategory := data["category"].(string)
+	createdAt, _ := data["created_at"].(string)
+	updatedAt, _ := data["updated_at"].(string)
+	_, hasEnableVoting := data["enable_voting"].(bool)
+	_, hasSSOGroupEnabled := data["sso_group_enabled"].(bool)
+	_, hasRequiresReview := data["requires_review"].(bool)
+	_, hasPublic := data["public"].(bool)
+	_, hasTotalMembers := data["total_members"].(float64)
+	_, hasTotalVotingRepos := data["total_voting_repos"].(float64)
+	_, hasMailingList := data["has_mailing_list"].(bool)
+	fullSnapshot := uid != "" && projectUID != "" && hasName && hasCategory &&
+		createdAt != "" && updatedAt != "" && hasEnableVoting &&
+		hasSSOGroupEnabled && hasRequiresReview && hasPublic &&
+		hasTotalMembers && hasTotalVotingRepos && hasMailingList
+	name, _ := data["name"].(string)
+	if name != "" {
+		payload.Name = &name
+	}
+	if category, ok := data["category"].(string); ok {
+		mapped := mapV2CategoryToV1(category)
+		payload.Category = &mapped
+	}
+	if desc, ok := data["description"].(string); ok {
+		payload.Description = &desc
+	} else if fullSnapshot {
+		payload.Description = new(string)
+	}
+	if website, ok := data["website"].(string); ok {
+		payload.Website = &website
+	} else if fullSnapshot {
+		payload.Website = new(string)
+	}
+	if joinMode, ok := data["join_mode"].(string); ok {
+		payload.JoinMode = &joinMode
+	} else if fullSnapshot {
+		payload.JoinMode = new(string)
+	}
+	if mailingListEmail, ok := data["mailing_list"].(string); ok {
+		payload.MailingList = &mailingListEmail
+	} else if mailingListEmail, ok := data["mailing_list_email"].(string); ok {
+		// Accept older events using the v1-facing key as well.
+		payload.MailingList = &mailingListEmail
+	} else if fullSnapshot {
+		payload.MailingList = new(string)
+	}
+	if chatChannel, ok := data["chat_channel"].(string); ok {
+		payload.ChatChannel = &chatChannel
+	} else if fullSnapshot {
+		payload.ChatChannel = new(string)
+	}
+	// This is a generated v2 identifier, not a user-clearable field. Never
+	// overwrite the v1 write-back with an empty name, even in a full snapshot.
+	if ssoGroupName, ok := data["sso_group_name"].(string); ok && ssoGroupName != "" {
+		payload.SSOGroupName = &ssoGroupName
+	}
+	return payload
 }
 
 // syncCommitteeDeleteToV1 deletes a v1 committee that was deleted in v2.
@@ -1207,73 +1250,98 @@ func mapV2DataToV1ProjectCreatePayload(ctx context.Context, data map[string]any)
 }
 
 // mapV2DataToV1ProjectUpdatePayload converts a v2 project.updated event body's
-// data map into a v1 project-service update payload. Only fields present in the
-// event body are set on the payload; omitempty on the struct fields keeps unset
-// fields out of the PATCH request so v1 defaults / existing values are preserved.
+// data map into a v1 project-service update payload. Absent fields are omitted;
+// explicitly empty strings and arrays are sent so v1 can clear them.
 func mapV2DataToV1ProjectUpdatePayload(ctx context.Context, data map[string]any) (*projectServiceProjectUpdate, error) {
 	payload := &projectServiceProjectUpdate{}
 
 	if name, ok := data["name"].(string); ok && name != "" {
-		payload.Name = name
+		payload.Name = &name
 	}
 	// is_foundation may switch on/off across updates (rare but possible when a
 	// project graduates or is reclassified); mirror the create-path mapping so
 	// v1 ProjectType tracks the v2 flag rather than silently drifting.
 	if isFoundation, ok := data["is_foundation"].(bool); ok {
 		if isFoundation {
-			payload.ProjectType = "Project Group"
+			projectType := "Project Group"
+			payload.ProjectType = &projectType
 		} else {
-			payload.ProjectType = "Project"
+			projectType := "Project"
+			payload.ProjectType = &projectType
 		}
 	}
 	if slug, ok := data["slug"].(string); ok && slug != "" {
-		payload.Slug = slug
+		payload.Slug = &slug
 	}
-	if desc, ok := data["description"].(string); ok && desc != "" {
-		payload.Description = desc
+	if desc, ok := data["description"].(string); ok {
+		payload.Description = &desc
 	}
-	if stage, ok := data["stage"].(string); ok && stage != "" {
-		payload.Status = stage
+	if stage, ok := data["stage"].(string); ok {
+		payload.Status = &stage
 	}
-	if category, ok := data["category"].(string); ok && category != "" {
-		payload.Category = category
+	if category, ok := data["category"].(string); ok {
+		payload.Category = &category
 	}
-	if legalEntityType, ok := data["legal_entity_type"].(string); ok && legalEntityType != "" {
-		payload.EntityType = legalEntityType
+	if legalEntityType, ok := data["legal_entity_type"].(string); ok {
+		payload.EntityType = &legalEntityType
 	}
-	if legalEntityName, ok := data["legal_entity_name"].(string); ok && legalEntityName != "" {
-		payload.EntityName = legalEntityName
+	if legalEntityName, ok := data["legal_entity_name"].(string); ok {
+		payload.EntityName = &legalEntityName
 	}
-	if funding, ok := data["funding"].(string); ok && funding != "" {
-		payload.Funding = funding
+	if funding, ok := data["funding"].(string); ok {
+		payload.Funding = &funding
 	}
 	if fundingModels, ok := extractStringSlice(data["funding_model"]); ok {
-		payload.Model = fundingModels
+		payload.Model = &fundingModels
+	} else if models, present := data["funding_model"]; present {
+		// A nil model (from the v2 ProjectBase) or an empty array clears
+		// the list. Do not clear on a malformed, non-empty array.
+		switch values := models.(type) {
+		case nil:
+			empty := []string{}
+			payload.Model = &empty
+		case []any:
+			if len(values) == 0 {
+				empty := []string{}
+				payload.Model = &empty
+			}
+		case []string:
+			if len(values) == 0 {
+				empty := []string{}
+				payload.Model = &empty
+			}
+		}
 	}
-	if charterURL, ok := data["charter_url"].(string); ok && charterURL != "" {
-		payload.CharterURL = charterURL
+	if charterURL, ok := data["charter_url"].(string); ok {
+		payload.CharterURL = &charterURL
 	}
 	if autojoin, ok := data["autojoin_enabled"].(bool); ok {
 		val := autojoin
 		payload.AutoJoinEnabled = &val
 	}
-	if formationDate, ok := data["formation_date"].(string); ok && formationDate != "" {
-		payload.StartDate = extractDateOnly(formationDate)
+	if formationDate, ok := data["formation_date"].(string); ok {
+		date := extractDateOnly(formationDate)
+		payload.StartDate = &date
+	} else if date, present := data["formation_date"]; present && date == nil {
+		payload.StartDate = new(string)
 	}
-	if logoURL, ok := data["logo_url"].(string); ok && logoURL != "" {
-		payload.ProjectLogo = logoURL
+	if logoURL, ok := data["logo_url"].(string); ok {
+		payload.ProjectLogo = &logoURL
 	}
-	if repoURL, ok := data["repository_url"].(string); ok && repoURL != "" {
-		payload.RepositoryURL = repoURL
+	if repoURL, ok := data["repository_url"].(string); ok {
+		payload.RepositoryURL = &repoURL
 	}
-	if websiteURL, ok := data["website_url"].(string); ok && websiteURL != "" {
-		payload.Website = websiteURL
+	if websiteURL, ok := data["website_url"].(string); ok {
+		payload.Website = &websiteURL
 	}
-	if dissolutionDate, ok := data["entity_dissolution_date"].(string); ok && dissolutionDate != "" {
-		payload.ProjectEntityDissolutionDate = extractDateOnly(dissolutionDate)
+	if dissolutionDate, ok := data["entity_dissolution_date"].(string); ok {
+		date := extractDateOnly(dissolutionDate)
+		payload.ProjectEntityDissolutionDate = &date
+	} else if date, present := data["entity_dissolution_date"]; present && date == nil {
+		payload.ProjectEntityDissolutionDate = new(string)
 	}
-	if formationDocURL, ok := data["entity_formation_document_url"].(string); ok && formationDocURL != "" {
-		payload.ProjectEntityFormationDocument = formationDocURL
+	if formationDocURL, ok := data["entity_formation_document_url"].(string); ok {
+		payload.ProjectEntityFormationDocument = &formationDocURL
 	}
 
 	if parentUID, ok := data["parent_uid"].(string); ok && strings.TrimSpace(parentUID) != "" {
@@ -1282,7 +1350,9 @@ func mapV2DataToV1ProjectUpdatePayload(ctx context.Context, data map[string]any)
 		if err != nil {
 			return nil, fmt.Errorf("could not resolve v1 project SFID for parent_uid %s: %w", parentUID, err)
 		}
-		payload.Parent = parentSFID
+		payload.Parent = &parentSFID
+	} else if _, ok := data["parent_uid"].(string); ok {
+		payload.Parent = new(string)
 	}
 
 	if legalParentUID, ok := data["legal_parent_uid"].(string); ok && strings.TrimSpace(legalParentUID) != "" {
@@ -1291,7 +1361,9 @@ func mapV2DataToV1ProjectUpdatePayload(ctx context.Context, data map[string]any)
 		if err != nil {
 			return nil, fmt.Errorf("could not resolve v1 project SFID for legal_parent_uid %s: %w", legalParentUID, err)
 		}
-		payload.LegalParentID = legalParentSFID
+		payload.LegalParentID = &legalParentSFID
+	} else if _, ok := data["legal_parent_uid"].(string); ok {
+		payload.LegalParentID = new(string)
 	}
 
 	return payload, nil
