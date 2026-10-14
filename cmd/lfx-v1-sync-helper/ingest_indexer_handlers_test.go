@@ -59,7 +59,7 @@ func (c indexerSyncCase) dispatch(t *testing.T, action string, data map[string]a
 	}
 	msg := &fakeMsg{subject: subject, data: payload}
 	newCommitteeEventsIngestHandler(processCommitteeIndexingEvent, processCommitteeMemberIndexingEvent)(msg)
-	if msg.acked == msg.nacked {
+	if msg.ackCalls+msg.nakCalls != 1 {
 		t.Fatalf("committee delivery must ACK or NAK exactly once: %+v", msg)
 	}
 	return msg.acked
@@ -115,7 +115,9 @@ func TestIndexerSyncCreate(t *testing.T) {
 					h.assertMapping(t, string(c.resource)+".sfid."+c.sfid, c.uid)
 					h.assertMapping(t, reverseKey, c.reverse)
 					// Replaying the same event must not create a duplicate.
-					c.dispatch(t, "created", c.create)
+					if !c.dispatch(t, "created", c.create) {
+						t.Fatal("replayed create should ACK")
+					}
 					if len(h.recordedRequests()) != 1 {
 						t.Fatal("replayed create bypassed loop guard")
 					}
