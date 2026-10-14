@@ -24,10 +24,12 @@ func init() {
 
 // fakeMsg is a test double for jetstream.Msg that records whether Ack or Nak was called.
 type fakeMsg struct {
-	subject string
-	data    []byte
-	acked   bool
-	nacked  bool
+	subject  string
+	data     []byte
+	acked    bool
+	nacked   bool
+	ackCalls int
+	nakCalls int
 }
 
 func (m *fakeMsg) Subject() string                           { return m.subject }
@@ -35,13 +37,21 @@ func (m *fakeMsg) Data() []byte                              { return m.data }
 func (m *fakeMsg) Headers() nats.Header                      { return nil }
 func (m *fakeMsg) Reply() string                             { return "" }
 func (m *fakeMsg) Metadata() (*jetstream.MsgMetadata, error) { return nil, nil }
-func (m *fakeMsg) Ack() error                                { m.acked = true; return nil }
-func (m *fakeMsg) DoubleAck(context.Context) error           { m.acked = true; return nil }
-func (m *fakeMsg) Nak() error                                { m.nacked = true; return nil }
-func (m *fakeMsg) NakWithDelay(time.Duration) error          { m.nacked = true; return nil }
-func (m *fakeMsg) InProgress() error                         { return nil }
-func (m *fakeMsg) Term() error                               { return nil }
-func (m *fakeMsg) TermWithReason(string) error               { return nil }
+func (m *fakeMsg) Ack() error {
+	m.acked = true
+	m.ackCalls++
+	return nil
+}
+func (m *fakeMsg) DoubleAck(context.Context) error { return m.Ack() }
+func (m *fakeMsg) Nak() error {
+	m.nacked = true
+	m.nakCalls++
+	return nil
+}
+func (m *fakeMsg) NakWithDelay(time.Duration) error { return m.Nak() }
+func (m *fakeMsg) InProgress() error                { return nil }
+func (m *fakeMsg) Term() error                      { return nil }
+func (m *fakeMsg) TermWithReason(string) error      { return nil }
 
 // errProc is a committeeEventProcessor that always returns a transient error.
 func errProc(_ context.Context, _ string, _ []byte) error {
