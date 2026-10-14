@@ -804,7 +804,11 @@ func syncCommitteeMemberDeleteToV1(ctx context.Context, memberUID, projectSFID, 
 	// ops can reconcile.
 	forwardSFID := recordSFID
 	if forwardSFID == "" {
-		if entry, err := mappingStore.Get(ctx, "committee_member.sfid."+memberSFID); err == nil && !isTombstonedMapping(entry.Value) {
+		entry, err := getMappingEntryWithRetry(ctx, "committee_member.sfid."+memberSFID)
+		if err != nil && !errors.Is(err, ErrKeyNotFound) {
+			log.With(errKey, err).ErrorContext(ctx, "failed to read committee member forward mapping after bounded retry — manual reconciliation may be required")
+		}
+		if err == nil && !isTombstonedMapping(entry.Value) {
 			if _, ownerUID, ok := splitTwoParts(string(entry.Value)); ok && ownerUID == memberUID {
 				forwardSFID = memberSFID
 			}
@@ -1546,10 +1550,16 @@ func committeeMemberRecordSFIDKey(memberUID string) string {
 
 // resolveCommitteeMemberRecordSFID looks up the platform-community__c record sfid for
 // a v2 committee member UID from its auxiliary mapping key. Returns "" if the key is
-// absent, tombstoned, or unreadable — all treated as "unknown", since this value is
-// only used to tombstone the forward mapping as a best effort on delete.
+// absent after bounded retries, tombstoned, or unreadable — all treated as
+// "unknown", since this value is only used to tombstone the forward mapping as a
+// best effort on delete. Retry absorbs a concurrent companion-key write; a
+// terminal store failure is logged at ERROR so skipped cleanup is visible.
 func resolveCommitteeMemberRecordSFID(ctx context.Context, memberUID string) string {
-	entry, err := mappingStore.Get(ctx, committeeMemberRecordSFIDKey(memberUID))
+	entry, err := getMappingEntryWithRetry(ctx, committeeMemberRecordSFIDKey(memberUID))
+	if err != nil && !errors.Is(err, ErrKeyNotFound) {
+		logger.With(errKey, err, "member_uid", memberUID).
+			ErrorContext(ctx, "failed to resolve committee member record SFID after bounded retry — forward mapping cleanup may be skipped")
+	}
 	if err != nil || isTombstonedMapping(entry.Value) {
 		return ""
 	}
