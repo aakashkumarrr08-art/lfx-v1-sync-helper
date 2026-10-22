@@ -512,6 +512,12 @@ func main() {
 			logger.With(append(res.logFields(), errKey, err)...).Error("error during committee-member voting reconciliation")
 			os.Exit(1)
 		}
+		// Per-member failures do not stop the run, but this Job is the repair
+		// step, so they must fail it rather than leave drift behind a success.
+		if res.errored > 0 {
+			logger.With(res.logFields()...).Error("committee-member voting reconciliation completed with errors")
+			os.Exit(1)
+		}
 		logger.With(res.logFields()...).Info("committee-member voting reconciliation completed successfully")
 		os.Exit(0)
 	}

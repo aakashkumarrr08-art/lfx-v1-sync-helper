@@ -10,8 +10,10 @@ import (
 	"log/slog"
 	"sort"
 	"testing"
+	"time"
 
 	committeeservice "github.com/linuxfoundation/lfx-v2-committee-service/gen/committee_service"
+	"golang.org/x/time/rate"
 )
 
 func TestClassifyVotingReconcile(t *testing.T) {
@@ -49,9 +51,11 @@ const (
 	reconcileTestRecordA   = "a0000000-0000-0000-0000-00000000000a"
 	reconcileTestRecordB   = "b0000000-0000-0000-0000-00000000000b"
 	reconcileTestRecordC   = "c0000000-0000-0000-0000-00000000000c"
+	reconcileTestRecordD   = "f0000000-0000-0000-0000-00000000000f"
 	reconcileTestContactA  = "lfContactAAAAAAAAA"
 	reconcileTestContactB  = "lfContactBBBBBBBBB"
 	reconcileTestContactC  = "lfContactCCCCCCCCC"
+	reconcileTestContactD  = "lfContactDDDDDDDDD"
 )
 
 func reconcileTestLogger(t *testing.T) {
@@ -82,6 +86,8 @@ func TestReconcileCommitteeMemberVotingJoin(t *testing.T) {
 		"m7": []byte(`{"uid":"m7","committee_uid":"cu"}`),
 		// undecodable.
 		"m8": []byte(`not json`),
+		// voting in sync, companion present but forward mapping missing (partial write).
+		"m9": []byte(`{"uid":"m9","committee_uid":"cu","voting":{"status":"Voting Rep"}}`),
 	}
 	reverse := map[string]string{
 		"m1": reconcileTestProject + ":" + reconcileTestCommittee + ":" + reconcileTestContactA,
@@ -90,15 +96,22 @@ func TestReconcileCommitteeMemberVotingJoin(t *testing.T) {
 		"m5": tombstoneMarker,
 		"m6": "only-one-part",
 		"m7": reconcileTestProject + ":" + reconcileTestCommittee + ":lfContactZZZZZZZZZ",
+		"m9": reconcileTestProject + ":" + reconcileTestCommittee + ":" + reconcileTestContactD,
 	}
 	companions := map[string]string{
 		"m2": reconcileTestRecordB,
 		"m3": reconcileTestRecordC,
+		"m9": reconcileTestRecordD,
+	}
+	forwards := map[string]string{
+		reconcileTestRecordB: "cu:m2",
+		reconcileTestRecordC: "cu:m3",
 	}
 	objects := map[string][]byte{
 		reconcileTestRecordA: []byte(`{"collaboration_name__c":"` + reconcileTestCommittee + `","contact_name__c":"` + reconcileTestContactA + `","voting_status__c":"Voting Rep"}`),
 		reconcileTestRecordB: []byte(`{"collaboration_name__c":"` + reconcileTestCommittee + `","contact_name__c":"` + reconcileTestContactB + `","voting_status__c":"Observer"}`),
 		reconcileTestRecordC: []byte(`{"collaboration_name__c":"` + reconcileTestCommittee + `","contact_name__c":"` + reconcileTestContactC + `","voting_status__c":"None"}`),
+		reconcileTestRecordD: []byte(`{"collaboration_name__c":"` + reconcileTestCommittee + `","contact_name__c":"` + reconcileTestContactD + `","voting_status__c":"Voting Rep"}`),
 		// soft-deleted record for m7's contact: must not be joined.
 		"d0000000-0000-0000-0000-00000000000d": []byte(`{"collaboration_name__c":"` + reconcileTestCommittee + `","contact_name__c":"lfContactZZZZZZZZZ","_sdc_deleted_at":"2026-01-01T00:00:00Z"}`),
 		"e0000000-0000-0000-0000-00000000000e": {0xc1}, // invalid in both JSON and msgpack
@@ -109,16 +122,16 @@ func TestReconcileCommitteeMemberVotingJoin(t *testing.T) {
 		t.Errorf("undecodable = %d, want 1", undecodable)
 	}
 	res := reconcileCommitteeMemberVotingResult{}
-	items := joinVotingReconcile(t.Context(), members, reverse, companions, idx, &res)
+	items := joinVotingReconcile(t.Context(), members, reverse, companions, forwards, idx, &res)
 
 	want := reconcileCommitteeMemberVotingResult{
-		inspected:       8,
+		inspected:       9,
 		noMapping:       2,
 		poisonedMapping: 1,
 		noV1Record:      1,
-		matched:         1,
+		matched:         2,
 		mismatched:      2,
-		mappingsMissing: 1,
+		mappingsMissing: 2,
 		errored:         1,
 	}
 	if res != want {
@@ -126,17 +139,21 @@ func TestReconcileCommitteeMemberVotingJoin(t *testing.T) {
 	}
 
 	sort.Slice(items, func(i, j int) bool { return items[i].memberUID < items[j].memberUID })
-	if len(items) != 2 {
-		t.Fatalf("items = %+v, want m1 and m3", items)
+	if len(items) != 3 {
+		t.Fatalf("items = %+v, want m1, m3 and m9", items)
 	}
-	m1, m3 := items[0], items[1]
-	if m1.memberUID != "m1" || !m1.mismatch || m1.target != v1NoVotingStatus || !m1.needsMappings ||
-		m1.recordSFID != reconcileTestRecordA || m1.contactSFID != reconcileTestContactA || m1.projectSFID != reconcileTestProject {
+	m1, m3, m9 := items[0], items[1], items[2]
+	if m1.memberUID != "m1" || !m1.mismatch || m1.target != v1NoVotingStatus || !m1.needsCompanion || !m1.needsForward ||
+		m1.recordSFID != reconcileTestRecordA || m1.contactSFID != reconcileTestContactA || m1.projectSFID != reconcileTestProject ||
+		m1.reverseMapping != reverse["m1"] {
 		t.Errorf("m1 = %+v", m1)
 	}
-	if m3.memberUID != "m3" || !m3.mismatch || m3.target != "Voting Rep" || m3.needsMappings ||
+	if m3.memberUID != "m3" || !m3.mismatch || m3.target != "Voting Rep" || m3.needsCompanion || m3.needsForward ||
 		m3.recordSFID != reconcileTestRecordC || m3.contactSFID != reconcileTestContactC {
 		t.Errorf("m3 = %+v", m3)
+	}
+	if m9.memberUID != "m9" || m9.mismatch || m9.needsCompanion || !m9.needsForward || m9.recordSFID != reconcileTestRecordD {
+		t.Errorf("m9 = %+v", m9)
 	}
 }
 
@@ -147,13 +164,24 @@ func TestReconcileCommitteeMemberVotingJoinAmbiguous(t *testing.T) {
 		reconcileTestRecordB: []byte(`{"collaboration_name__c":"` + reconcileTestCommittee + `","contact_name__c":"` + reconcileTestContactA + `","voting_status__c":"Observer"}`),
 	}
 	idx, _ := buildV1MemberVotingIndex(objects)
-	res := reconcileCommitteeMemberVotingResult{}
-	items := joinVotingReconcile(t.Context(),
-		map[string][]byte{"m1": []byte(`{"uid":"m1","committee_uid":"cu","voting":{"status":""}}`)},
-		map[string]string{"m1": reconcileTestProject + ":" + reconcileTestCommittee + ":" + reconcileTestContactA},
-		nil, idx, &res)
-	if len(items) != 0 || res.ambiguousV1Record != 1 {
-		t.Errorf("items = %+v, ambiguous = %d; want none and 1", items, res.ambiguousV1Record)
+	member := map[string][]byte{"m1": []byte(`{"uid":"m1","committee_uid":"cu","voting":{"status":""}}`)}
+	tests := []struct {
+		name    string
+		reverse string
+	}{
+		{name: "contact SFID reverse mapping", reverse: reconcileTestProject + ":" + reconcileTestCommittee + ":" + reconcileTestContactA},
+		// The legacy branch selects one row by record SFID, but the PATCH path
+		// takes the shared contact SFID, so it must be skipped as well.
+		{name: "legacy record SFID reverse mapping", reverse: reconcileTestProject + ":" + reconcileTestCommittee + ":" + reconcileTestRecordA},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			res := reconcileCommitteeMemberVotingResult{}
+			items := joinVotingReconcile(t.Context(), member, map[string]string{"m1": tt.reverse}, nil, nil, idx, &res)
+			if len(items) != 0 || res.ambiguousV1Record != 1 {
+				t.Errorf("items = %+v, ambiguous = %d; want none and 1", items, res.ambiguousV1Record)
+			}
+		})
 	}
 }
 
@@ -264,22 +292,37 @@ func TestReconcileCommitteeMemberVotingCreateMapping(t *testing.T) {
 
 func TestReconcileCommitteeMemberVotingBackfillMappings(t *testing.T) {
 	reconcileTestLogger(t)
-	item := votingReconcileItem{memberUID: "m1", committeeUID: "cu", recordSFID: reconcileTestRecordA}
+	reverseValue := reconcileTestProject + ":" + reconcileTestCommittee + ":" + reconcileTestContactA
 	forwardKey := "committee_member.sfid." + reconcileTestRecordA
 	companionKey := committeeMemberRecordSFIDKey("m1")
+	reverseKey := "committee_member.uid.m1"
 
 	tests := []struct {
-		name          string
-		forward       string // pre-existing forward value; "" means absent
-		wantCompanion bool
-		wantForward   string
-		wantCreated   int
-		wantConflicts int
+		name           string
+		reverse        string // live reverse mapping value; "" means absent
+		companion      string // pre-existing companion value; "" means absent
+		forward        string // pre-existing forward value; "" means absent
+		needsCompanion bool
+		createErr      error // returned by the first Create (the forward key)
+		wantCompanion  string
+		wantForward    string
+		wantCreated    int
+		wantConflicts  int
+		wantNoMapping  int
+		wantErrored    int
 	}{
-		{name: "absent forward writes both", wantCompanion: true, wantForward: "cu:m1", wantCreated: 2},
-		{name: "matching forward writes companion only", forward: "cu:m1", wantCompanion: true, wantForward: "cu:m1", wantCreated: 1},
-		{name: "forward owned by another member writes nothing", forward: "cu:other", wantForward: "cu:other", wantConflicts: 1},
-		{name: "tombstoned forward writes nothing", forward: tombstoneMarker, wantForward: tombstoneMarker, wantConflicts: 1},
+		{name: "absent forward writes both", reverse: reverseValue, needsCompanion: true, wantCompanion: reconcileTestRecordA, wantForward: "cu:m1", wantCreated: 2},
+		{name: "matching forward writes companion only", reverse: reverseValue, forward: "cu:m1", needsCompanion: true, wantCompanion: reconcileTestRecordA, wantForward: "cu:m1", wantCreated: 1},
+		{name: "forward owned by another member writes nothing", reverse: reverseValue, forward: "cu:other", needsCompanion: true, wantForward: "cu:other", wantConflicts: 1},
+		{name: "tombstoned forward writes nothing", reverse: reverseValue, forward: tombstoneMarker, needsCompanion: true, wantForward: tombstoneMarker, wantConflicts: 1},
+		// Partial write from an earlier run or the live create path: companion
+		// written, forward write failed. Only the forward key is repaired.
+		{name: "companion present repairs missing forward only", reverse: reverseValue, companion: reconcileTestRecordA, wantCompanion: reconcileTestRecordA, wantForward: "cu:m1", wantCreated: 1},
+		// The forward key is the ownership claim: if it cannot be written, no
+		// companion is left behind for a later v2 delete to act on.
+		{name: "forward write failure leaves no companion", reverse: reverseValue, needsCompanion: true, createErr: errors.New("store unavailable"), wantErrored: 1},
+		{name: "member deleted since the scan writes nothing", reverse: tombstoneMarker, needsCompanion: true, wantNoMapping: 1},
+		{name: "reverse mapping gone writes nothing", needsCompanion: true, wantNoMapping: 1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -288,28 +331,73 @@ func TestReconcileCommitteeMemberVotingBackfillMappings(t *testing.T) {
 			mappingStore = store
 			t.Cleanup(func() { mappingStore = orig })
 			ctx := t.Context()
-			if tt.forward != "" {
-				if _, err := store.Put(ctx, forwardKey, []byte(tt.forward)); err != nil {
+			for key, value := range map[string]string{reverseKey: tt.reverse, companionKey: tt.companion, forwardKey: tt.forward} {
+				if value == "" {
+					continue
+				}
+				if _, err := store.Put(ctx, key, []byte(value)); err != nil {
 					t.Fatal(err)
 				}
 			}
+			store.nextCreateErr = tt.createErr
 
+			item := votingReconcileItem{
+				memberUID: "m1", committeeUID: "cu", recordSFID: reconcileTestRecordA, reverseMapping: reverseValue,
+				needsCompanion: tt.needsCompanion, needsForward: true,
+			}
 			res := reconcileCommitteeMemberVotingResult{}
 			backfillReconcileMappings(ctx, item, "committee_member.sfid.", &res)
 
-			companion, err := store.Get(ctx, companionKey)
-			if gotCompanion := err == nil; gotCompanion != tt.wantCompanion {
-				t.Errorf("companion written = %v, want %v", gotCompanion, tt.wantCompanion)
-			} else if gotCompanion && string(companion.Value) != reconcileTestRecordA {
-				t.Errorf("companion = %q, want %q", companion.Value, reconcileTestRecordA)
+			if companion, _ := store.Get(ctx, companionKey); string(companion.Value) != tt.wantCompanion {
+				t.Errorf("companion = %q, want %q", companion.Value, tt.wantCompanion)
 			}
 			if forward, _ := store.Get(ctx, forwardKey); string(forward.Value) != tt.wantForward {
 				t.Errorf("forward = %q, want %q", forward.Value, tt.wantForward)
 			}
-			if res.mappingsBackfilled != tt.wantCreated || res.mappingConflicts != tt.wantConflicts || res.errored != 0 {
+			if res.mappingsBackfilled != tt.wantCreated || res.mappingConflicts != tt.wantConflicts ||
+				res.noMapping != tt.wantNoMapping || res.errored != tt.wantErrored {
 				t.Errorf("counters = %+v", res)
 			}
 		})
+	}
+}
+
+// TestReconcileCommitteeMemberVotingItemTimeout verifies that a hung v1 PATCH
+// is bounded by reconcileMemberTimeout, counted as an error, and does not stop
+// the remaining members from being reconciled.
+func TestReconcileCommitteeMemberVotingItemTimeout(t *testing.T) {
+	reconcileTestLogger(t)
+	origFetch, origGet, origUpdate, origTimeout := reconcileFetchCommitteeMemberFn, reconcileGetV1ObjectFn, reconcileUpdateV1MemberFn, reconcileMemberTimeout
+	t.Cleanup(func() {
+		reconcileFetchCommitteeMemberFn, reconcileGetV1ObjectFn, reconcileUpdateV1MemberFn = origFetch, origGet, origUpdate
+		reconcileMemberTimeout = origTimeout
+	})
+	reconcileMemberTimeout = 20 * time.Millisecond
+
+	reconcileFetchCommitteeMemberFn = func(context.Context, string, string) (*committeeservice.CommitteeMemberFullWithReadonlyAttributes, string, error) {
+		return &committeeservice.CommitteeMemberFullWithReadonlyAttributes{}, "etag", nil
+	}
+	reconcileGetV1ObjectFn = func(context.Context, string) (map[string]any, bool, error) {
+		return map[string]any{"voting_status__c": "Voting Rep"}, true, nil
+	}
+	reconcileUpdateV1MemberFn = func(ctx context.Context, _, _, memberSFID string, _ projectServiceCommitteeMemberUpdate) error {
+		if memberSFID == reconcileTestContactA {
+			<-ctx.Done() // hung gateway
+			return ctx.Err()
+		}
+		return nil
+	}
+
+	items := []votingReconcileItem{
+		{memberUID: "m1", committeeUID: "cu", contactSFID: reconcileTestContactA, recordSFID: reconcileTestRecordA, mismatch: true},
+		{memberUID: "m2", committeeUID: "cu", contactSFID: reconcileTestContactB, recordSFID: reconcileTestRecordB, mismatch: true},
+	}
+	res := reconcileCommitteeMemberVotingResult{}
+	if err := applyVotingReconcileItems(t.Context(), items, rate.NewLimiter(rate.Inf, 1), "committee_member.sfid.", "platform-community__c.", &res); err != nil {
+		t.Fatalf("applyVotingReconcileItems: %v", err)
+	}
+	if res.errored != 1 || res.patched != 1 {
+		t.Errorf("counters = %+v; want errored=1 patched=1", res)
 	}
 }
 

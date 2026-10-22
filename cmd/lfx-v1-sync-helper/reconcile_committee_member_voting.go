@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"golang.org/x/time/rate"
 )
@@ -33,7 +34,7 @@ type reconcileCommitteeMemberVotingResult struct {
 	mismatched           int // voting status differs between v2 and v1
 	patched              int // v1 PATCHed to the v2 value (live run)
 	skippedNowEqual      int // mismatch resolved by the time of the live re-check
-	mappingsMissing      int // members without a record-sfid companion mapping
+	mappingsMissing      int // members missing the record-sfid companion or the record-keyed forward mapping
 	mappingsBackfilled   int // mapping keys created (companion + forward, live run)
 	mappingConflicts     int // mapping key already present with a different value
 	errored              int // decode, fetch, KV or v1 API failures
@@ -152,29 +153,33 @@ func buildV1MemberVotingIndex(objects map[string][]byte) (v1MemberVotingIndex, i
 // votingReconcileItem is a v2 member joined to its v1 record that needs a
 // voting PATCH, a mapping backfill, or both.
 type votingReconcileItem struct {
-	memberUID     string
-	committeeUID  string
-	projectSFID   string
-	committeeSFID string
-	contactSFID   string
-	recordSFID    string
-	v2Status      string
-	v1Status      string
-	target        string
-	mismatch      bool
-	needsMappings bool
+	memberUID      string
+	committeeUID   string
+	reverseMapping string // reverse mapping value at scan time, re-checked before mapping writes
+	projectSFID    string
+	committeeSFID  string
+	contactSFID    string
+	recordSFID     string
+	v2Status       string
+	v1Status       string
+	target         string
+	mismatch       bool
+	needsCompanion bool // record-sfid companion missing
+	needsForward   bool // record-keyed forward mapping missing
 }
 
 // joinVotingReconcile joins each v2 committee member (members: KV key → raw
 // JSON) to its reverse mapping (reverse: member UID → mapping value), its
-// record-sfid companion (companions: member UID → value) and its v1 record,
-// classifies the pair and updates the counters in res. It returns the
-// members that need a voting PATCH or a mapping backfill.
+// record-sfid companion (companions: member UID → value), its record-keyed
+// forward mapping (forwards: SFID → value) and its v1 record, classifies the
+// pair and updates the counters in res. It returns the members that need a
+// voting PATCH or a mapping backfill.
 func joinVotingReconcile(
 	ctx context.Context,
 	members map[string][]byte,
 	reverse map[string]string,
 	companions map[string]string,
+	forwards map[string]string,
 	v1 v1MemberVotingIndex,
 	res *reconcileCommitteeMemberVotingResult,
 ) []votingReconcileItem {
@@ -208,14 +213,7 @@ func joinVotingReconcile(
 		var v1Rec v1MemberVoting
 		var found bool
 		if contactSFID != "" {
-			joinKey := committeeSFID + ":" + contactSFID
-			if v1.ambiguous[joinKey] {
-				logger.With("member_uid", rec.UID, "committee_sfid", committeeSFID).
-					WarnContext(ctx, "reconcile: more than one live v1 record for this committee member, skipping")
-				res.ambiguousV1Record++
-				continue
-			}
-			v1Rec, found = v1.byContact[joinKey]
+			v1Rec, found = v1.byContact[committeeSFID+":"+contactSFID]
 		} else {
 			// Legacy reverse mapping that stores the record sfid instead of the contact SFID.
 			v1Rec, found = v1.byRecord[recordSFID]
@@ -231,15 +229,25 @@ func joinVotingReconcile(
 			res.poisonedMapping++
 			continue
 		}
+		// Checked after the contact SFID is resolved so the legacy record-sfid
+		// join is covered too: the PATCH path takes the contact SFID and cannot
+		// target one of several live records for the same committee + contact.
+		if v1.ambiguous[committeeSFID+":"+contactSFID] {
+			logger.With("member_uid", rec.UID, "committee_sfid", committeeSFID).
+				WarnContext(ctx, "reconcile: more than one live v1 record for this committee member, skipping")
+			res.ambiguousV1Record++
+			continue
+		}
 
 		item := votingReconcileItem{
-			memberUID:     rec.UID,
-			committeeUID:  rec.CommitteeUID,
-			projectSFID:   projectSFID,
-			committeeSFID: committeeSFID,
-			contactSFID:   contactSFID,
-			recordSFID:    v1Rec.recordSFID,
-			v1Status:      v1Rec.votingStatus,
+			memberUID:      rec.UID,
+			committeeUID:   rec.CommitteeUID,
+			reverseMapping: mappingValue,
+			projectSFID:    projectSFID,
+			committeeSFID:  committeeSFID,
+			contactSFID:    contactSFID,
+			recordSFID:     v1Rec.recordSFID,
+			v1Status:       v1Rec.votingStatus,
 		}
 		if rec.Voting != nil {
 			item.v2Status = rec.Voting.Status
@@ -251,13 +259,22 @@ func joinVotingReconcile(
 			res.matched++
 		}
 
+		// A companion without its forward key is a partial write (companion
+		// written, forward write failed); repair the forward key alone. A
+		// tombstoned forward key was deleted on purpose and is left alone.
 		companion, hasCompanion := companions[rec.UID]
 		if !hasCompanion || isTombstonedMapping([]byte(companion)) {
-			item.needsMappings = true
+			item.needsCompanion = true
+			item.needsForward = true
+		} else if companion == item.recordSFID {
+			_, hasForward := forwards[item.recordSFID]
+			item.needsForward = !hasForward
+		}
+		if item.needsCompanion || item.needsForward {
 			res.mappingsMissing++
 		}
 
-		if item.mismatch || item.needsMappings {
+		if item.mismatch || item.needsCompanion || item.needsForward {
 			items = append(items, item)
 		}
 	}
@@ -291,6 +308,8 @@ func reconcileCommitteeMemberVoting(ctx context.Context, opts reconcileCommittee
 		reverseSubjectPfx   = "$KV.v1-mappings.committee_member.uid."
 		companionSubject    = "$KV.v1-mappings.committee_member.record_sfid.*"
 		companionSubjectPfx = "$KV.v1-mappings.committee_member.record_sfid."
+		forwardSubject      = "$KV.v1-mappings.committee_member.sfid.*"
+		forwardSubjectPfx   = "$KV.v1-mappings.committee_member.sfid."
 
 		v1ObjectsStream         = "KV_v1-objects"
 		v1ObjectSubject         = "$KV.v1-objects.platform-community__c.*"
@@ -340,6 +359,10 @@ func reconcileCommitteeMemberVoting(ctx context.Context, opts reconcileCommittee
 	if err != nil {
 		return res, err
 	}
+	forwardRaw, err := scan(mappingsStream, forwardSubject, forwardSubjectPfx)
+	if err != nil {
+		return res, err
+	}
 	v1Objects, err := scan(v1ObjectsStream, v1ObjectSubject, v1ObjectSubjectPfx)
 	if err != nil {
 		return res, err
@@ -347,7 +370,7 @@ func reconcileCommitteeMemberVoting(ctx context.Context, opts reconcileCommittee
 
 	v1Index, undecodable := buildV1MemberVotingIndex(v1Objects)
 	res.v1ObjectsUndecodable = undecodable
-	items := joinVotingReconcile(ctx, members, toStrings(reverseRaw), toStrings(companionRaw), v1Index, &res)
+	items := joinVotingReconcile(ctx, members, toStrings(reverseRaw), toStrings(companionRaw), toStrings(forwardRaw), v1Index, &res)
 
 	if opts.dryRun {
 		for _, item := range items {
@@ -359,26 +382,48 @@ func reconcileCommitteeMemberVoting(ctx context.Context, opts reconcileCommittee
 				"v1_voting_status", item.v1Status,
 				"target", item.target,
 				"mismatch", item.mismatch,
-				"needs_mappings", item.needsMappings,
+				"needs_companion", item.needsCompanion,
+				"needs_forward", item.needsForward,
 			).InfoContext(ctx, "[dry-run] reconcile: committee member would be updated")
 		}
 		return res, nil
 	}
 
 	limiter := rate.NewLimiter(rate.Limit(opts.emitRate), 1)
+	err = applyVotingReconcileItems(ctx, items, limiter, forwardMappingKeyPrefix, v1ObjectKeyPrefix, &res)
+	return res, err
+}
+
+// reconcileMemberTimeout bounds one member's mapping backfill, re-reads and
+// PATCH, so a hung upstream call (v1HTTPClient has no client timeout) cannot
+// stall the remaining members. Declared as a var (not const) so tests can
+// shorten it.
+var reconcileMemberTimeout = 2 * time.Minute
+
+// applyVotingReconcileItems runs the live mapping backfill and voting PATCH
+// for each item, pacing PATCHes with limiter. Per-member failures, including
+// timeouts, are counted in res and do not stop the run; only cancellation of
+// ctx does.
+func applyVotingReconcileItems(ctx context.Context, items []votingReconcileItem, limiter *rate.Limiter, forwardMappingKeyPrefix, v1ObjectKeyPrefix string, res *reconcileCommitteeMemberVotingResult) error {
 	for _, item := range items {
-		if item.needsMappings {
-			backfillReconcileMappings(ctx, item, forwardMappingKeyPrefix, &res)
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		if !item.mismatch {
-			continue
+		if item.mismatch {
+			if err := limiter.Wait(ctx); err != nil {
+				return err
+			}
 		}
-		if err := limiter.Wait(ctx); err != nil {
-			return res, err
+		itemCtx, cancel := context.WithTimeout(ctx, reconcileMemberTimeout)
+		if item.needsCompanion || item.needsForward {
+			backfillReconcileMappings(itemCtx, item, forwardMappingKeyPrefix, res)
 		}
-		applyVotingReconcilePatch(ctx, item, v1ObjectKeyPrefix, &res)
+		if item.mismatch {
+			applyVotingReconcilePatch(itemCtx, item, v1ObjectKeyPrefix, res)
+		}
+		cancel()
 	}
-	return res, nil
+	return nil
 }
 
 // applyVotingReconcilePatch re-reads the live v2 member and v1 record, then
@@ -425,30 +470,40 @@ func applyVotingReconcilePatch(ctx context.Context, item votingReconcileItem, v1
 	res.patched++
 }
 
-// backfillReconcileMappings writes the record-sfid companion and then the
-// record-keyed forward mapping for item. The forward key is checked first: a
-// companion pointing at a record whose forward key belongs to another member
-// would make a later v2 delete of this member (syncCommitteeMemberDeleteToV1)
-// tombstone that member's forward mapping and silence its WAL delete.
+// backfillReconcileMappings writes the record-keyed forward mapping and then,
+// if missing, the record-sfid companion for item.
+//
+// The live reverse mapping is re-read first, so a member deleted in v2 after
+// the scan does not regain live links; a delete landing between this read and
+// the writes below is not covered.
+//
+// The forward key is written first because Create is an atomic ownership
+// claim: the companion is written only once this member owns the forward key.
+// A companion pointing at a record whose forward key belongs to another
+// member would make a later v2 delete of this member
+// (syncCommitteeMemberDeleteToV1) tombstone that member's forward mapping. A
+// failed companion write leaves the companion missing, so a rerun retries it.
 func backfillReconcileMappings(ctx context.Context, item votingReconcileItem, forwardMappingKeyPrefix string, res *reconcileCommitteeMemberVotingResult) {
-	forwardKey := forwardMappingKeyPrefix + item.recordSFID
-	forwardValue := item.committeeUID + ":" + item.memberUID
-
-	entry, err := mappingStore.Get(ctx, forwardKey)
+	reverseKey := "committee_member.uid." + item.memberUID
+	entry, err := mappingStore.Get(ctx, reverseKey)
 	switch {
-	case err == nil && string(entry.Value) != forwardValue:
-		logger.With("key", forwardKey, "member_uid", item.memberUID).
-			WarnContext(ctx, "reconcile: forward mapping key already exists with a different value, not writing the record sfid companion")
-		res.mappingConflicts++
+	case errors.Is(err, ErrKeyNotFound), err == nil && string(entry.Value) != item.reverseMapping:
+		logger.With("member_uid", item.memberUID).
+			InfoContext(ctx, "reconcile: reverse mapping removed or changed since the scan, not writing mappings")
+		res.noMapping++
 		return
-	case err != nil && !errors.Is(err, ErrKeyNotFound):
-		logger.With(errKey, err, "key", forwardKey).WarnContext(ctx, "reconcile: failed to read forward mapping")
+	case err != nil:
+		logger.With(errKey, err, "key", reverseKey).WarnContext(ctx, "reconcile: failed to re-read reverse mapping")
 		res.errored++
 		return
 	}
 
-	if createReconcileMapping(ctx, committeeMemberRecordSFIDKey(item.memberUID), item.recordSFID, res) {
-		createReconcileMapping(ctx, forwardKey, forwardValue, res)
+	forwardKey := forwardMappingKeyPrefix + item.recordSFID
+	if !createReconcileMapping(ctx, forwardKey, item.committeeUID+":"+item.memberUID, res) {
+		return
+	}
+	if item.needsCompanion {
+		createReconcileMapping(ctx, committeeMemberRecordSFIDKey(item.memberUID), item.recordSFID, res)
 	}
 }
 

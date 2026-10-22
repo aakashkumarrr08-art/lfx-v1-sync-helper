@@ -7,6 +7,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	committeeservice "github.com/linuxfoundation/lfx-v2-committee-service/gen/committee_service"
 )
@@ -201,6 +202,8 @@ func updateCommitteeMember(ctx context.Context, payload *committeeservice.Update
 		return false, wrapCommitteeServiceError("failed to fetch current committee member", err)
 	}
 
+	preserveUnsetVotingStatus(currentMember, payload)
+
 	// Check if member has changes (basic comparison).
 	memberChanged := !committeeMembersEqual(currentMember, payload)
 
@@ -279,6 +282,25 @@ func deleteCommitteeMember(ctx context.Context, committeeUID, memberUID string, 
 	}
 
 	return nil
+}
+
+// preserveUnsetVotingStatus drops an incoming v1NoVotingStatus from update when
+// the current v2 member has no voting status. The v2→v1 sync writes
+// v1NoVotingStatus for such a member because v1 cannot store an empty status,
+// so a later v1 edit of any other field re-emits it; without this the v2
+// member would be set to "Observer" (lfx-self-serve#4079). A nil Voting is how
+// the v1→v2 mappers already express "no voting status".
+func preserveUnsetVotingStatus(current *committeeservice.CommitteeMemberFullWithReadonlyAttributes, update *committeeservice.UpdateCommitteeMemberPayload) {
+	if update.Voting == nil || !strings.EqualFold(strings.TrimSpace(update.Voting.Status), v1NoVotingStatus) {
+		return
+	}
+	var currentStatus string
+	if current != nil && current.Voting != nil {
+		currentStatus = current.Voting.Status
+	}
+	if normalizeVotingStatus(currentStatus) == "" {
+		update.Voting = nil
+	}
 }
 
 // committeeMembersEqual compares a committee member with an update payload for equality.

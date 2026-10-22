@@ -629,3 +629,48 @@ func TestCommitteeMembersEqualVotingNone(t *testing.T) {
 		})
 	}
 }
+
+// TestPreserveUnsetVotingStatus verifies that the v1NoVotingStatus written to
+// v1 for a v2 member with no voting status is not synced back into v2 as a
+// real status when an unrelated v1 field changes (lfx-self-serve#4079).
+func TestPreserveUnsetVotingStatus(t *testing.T) {
+	type voting = struct {
+		Status    string
+		StartDate *string
+		EndDate   *string
+	}
+	email := "member@example.com"
+
+	tests := []struct {
+		name       string
+		current    *voting
+		update     *voting
+		wantStatus string // "" means update.Voting is nil afterwards
+		wantEqual  bool
+	}{
+		{"nil vs Observer", nil, &voting{Status: "Observer"}, "", true},
+		{"empty vs observer casing", &voting{Status: ""}, &voting{Status: " observer "}, "", true},
+		{"legacy None vs Observer", &voting{Status: "None"}, &voting{Status: "Observer"}, "", true},
+		{"Voting Rep vs Observer is a change", &voting{Status: "Voting Rep"}, &voting{Status: "Observer"}, "Observer", false},
+		{"nil vs Voting Rep is a change", nil, &voting{Status: "Voting Rep"}, "Voting Rep", false},
+		{"Observer vs Observer is untouched", &voting{Status: "Observer"}, &voting{Status: "Observer"}, "Observer", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			current := &committeeservice.CommitteeMemberFullWithReadonlyAttributes{Email: &email, Voting: tt.current}
+			update := &committeeservice.UpdateCommitteeMemberPayload{Email: email, Voting: tt.update}
+			preserveUnsetVotingStatus(current, update)
+
+			gotStatus := ""
+			if update.Voting != nil {
+				gotStatus = update.Voting.Status
+			}
+			if gotStatus != tt.wantStatus {
+				t.Errorf("update voting status = %q, want %q", gotStatus, tt.wantStatus)
+			}
+			if got := committeeMembersEqual(current, update); got != tt.wantEqual {
+				t.Errorf("committeeMembersEqual = %v, want %v", got, tt.wantEqual)
+			}
+		})
+	}
+}
