@@ -111,18 +111,22 @@ type v1MemberVotingIndex struct {
 
 // buildV1MemberVotingIndex builds the index from a key → raw value map of
 // platform-community__c records (keys are record SFIDs), skipping
-// soft-deleted rows. It returns the number of undecodable values.
-func buildV1MemberVotingIndex(objects map[string][]byte) (v1MemberVotingIndex, int) {
+// soft-deleted rows. An undecodable value counts as both
+// v1ObjectsUndecodable and errored: its member would otherwise be reported as
+// no_v1_record without its voting status ever being checked.
+func buildV1MemberVotingIndex(ctx context.Context, objects map[string][]byte, res *reconcileCommitteeMemberVotingResult) v1MemberVotingIndex {
 	idx := v1MemberVotingIndex{
 		byContact: make(map[string]v1MemberVoting, len(objects)),
 		byRecord:  make(map[string]v1MemberVoting, len(objects)),
 		ambiguous: map[string]bool{},
 	}
-	undecodable := 0
 	for recordSFID, raw := range objects {
 		v1Data, err := decodeV1CommitteeRow(raw)
 		if err != nil {
-			undecodable++
+			logger.With(errKey, err, "record_sfid", recordSFID).
+				WarnContext(ctx, "reconcile: v1 committee member record undecodable, skipping")
+			res.v1ObjectsUndecodable++
+			res.errored++
 			continue
 		}
 		if v1RowIsSoftDeleted(v1Data) {
@@ -147,7 +151,7 @@ func buildV1MemberVotingIndex(objects map[string][]byte) (v1MemberVotingIndex, i
 		}
 		idx.byContact[key] = rec
 	}
-	return idx, undecodable
+	return idx
 }
 
 // votingReconcileItem is a v2 member joined to its v1 record that needs a
@@ -368,8 +372,7 @@ func reconcileCommitteeMemberVoting(ctx context.Context, opts reconcileCommittee
 		return res, err
 	}
 
-	v1Index, undecodable := buildV1MemberVotingIndex(v1Objects)
-	res.v1ObjectsUndecodable = undecodable
+	v1Index := buildV1MemberVotingIndex(ctx, v1Objects, &res)
 	items := joinVotingReconcile(ctx, members, toStrings(reverseRaw), toStrings(companionRaw), toStrings(forwardRaw), v1Index, &res)
 
 	if opts.dryRun {
@@ -448,7 +451,7 @@ func applyVotingReconcilePatch(ctx context.Context, item votingReconcileItem, fo
 		log.With(errKey, err, "key", forwardKey).WarnContext(ctx, "reconcile: failed to read forward mapping, not patching")
 		res.errored++
 		return
-	case string(forward.Value) != item.committeeUID+":"+item.memberUID:
+	case !forwardMappingNamesMember(string(forward.Value), item.committeeUID, item.memberUID):
 		log.WarnContext(ctx, "reconcile: v1 record's forward mapping belongs to another member or is tombstoned, not patching")
 		res.mappingConflicts++
 		return
@@ -525,20 +528,32 @@ func backfillReconcileMappings(ctx context.Context, item votingReconcileItem, fo
 	}
 
 	forwardKey := forwardMappingKeyPrefix + item.recordSFID
-	if !createReconcileMapping(ctx, forwardKey, item.committeeUID+":"+item.memberUID, res) {
+	ownsForward := func(existing string) bool {
+		return forwardMappingNamesMember(existing, item.committeeUID, item.memberUID)
+	}
+	if !createReconcileMapping(ctx, forwardKey, item.committeeUID+":"+item.memberUID, ownsForward, res) {
 		return false
 	}
 	if item.needsCompanion {
-		createReconcileMapping(ctx, committeeMemberRecordSFIDKey(item.memberUID), item.recordSFID, res)
+		createReconcileMapping(ctx, committeeMemberRecordSFIDKey(item.memberUID), item.recordSFID, nil, res)
 	}
 	return true
 }
 
+// forwardMappingNamesMember reports whether a committee_member.sfid.* value
+// names memberUID: either "committeeUID:memberUID" or the legacy bare
+// memberUID, which handleCommitteeMemberUpdate still accepts (and upgrades on
+// the next v1 edit). A tombstone or another member's UID does not match.
+func forwardMappingNamesMember(value, committeeUID, memberUID string) bool {
+	return value == committeeUID+":"+memberUID || value == memberUID
+}
+
 // createReconcileMapping creates a mapping key only if it is absent. An
-// existing key with the same value counts as success; one with a different
-// value is a conflict and is never overwritten. Returns true when the key
-// holds the intended value afterwards.
-func createReconcileMapping(ctx context.Context, key, value string, res *reconcileCommitteeMemberVotingResult) bool {
+// existing key with the same value, or one accepted by matches (when
+// non-nil), counts as success; any other value is a conflict. An existing key
+// is never overwritten. Returns true when the key holds an accepted value
+// afterwards.
+func createReconcileMapping(ctx context.Context, key, value string, matches func(existing string) bool, res *reconcileCommitteeMemberVotingResult) bool {
 	_, err := mappingStore.Create(ctx, key, []byte(value))
 	if err == nil {
 		res.mappingsBackfilled++
@@ -555,7 +570,7 @@ func createReconcileMapping(ctx context.Context, key, value string, res *reconci
 		res.errored++
 		return false
 	}
-	if string(entry.Value) == value {
+	if existing := string(entry.Value); existing == value || (matches != nil && matches(existing)) {
 		return true
 	}
 	logger.With("key", key).

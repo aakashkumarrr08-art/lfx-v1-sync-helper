@@ -10,6 +10,7 @@
 // clear the field. An omitted v1 status gets a v1-side default, so v2→v1 sends
 // v1NoVotingStatus explicitly to keep the member non-eligible for votes.
 
+// The lfx-v1-sync-helper service.
 package main
 
 import "strings"

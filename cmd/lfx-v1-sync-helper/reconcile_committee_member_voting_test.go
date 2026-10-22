@@ -117,22 +117,24 @@ func TestReconcileCommitteeMemberVotingJoin(t *testing.T) {
 		"e0000000-0000-0000-0000-00000000000e": {0xc1}, // invalid in both JSON and msgpack
 	}
 
-	idx, undecodable := buildV1MemberVotingIndex(objects)
-	if undecodable != 1 {
-		t.Errorf("undecodable = %d, want 1", undecodable)
-	}
 	res := reconcileCommitteeMemberVotingResult{}
+	idx := buildV1MemberVotingIndex(t.Context(), objects, &res)
+	if res.v1ObjectsUndecodable != 1 || res.errored != 1 {
+		t.Errorf("v1_objects_undecodable = %d, errored = %d; want 1 and 1", res.v1ObjectsUndecodable, res.errored)
+	}
 	items := joinVotingReconcile(t.Context(), members, reverse, companions, forwards, idx, &res)
 
+	// errored: one undecodable v1 record (e0…) and one undecodable member (m8).
 	want := reconcileCommitteeMemberVotingResult{
-		inspected:       9,
-		noMapping:       2,
-		poisonedMapping: 1,
-		noV1Record:      1,
-		matched:         2,
-		mismatched:      2,
-		mappingsMissing: 2,
-		errored:         1,
+		inspected:            9,
+		noMapping:            2,
+		poisonedMapping:      1,
+		noV1Record:           1,
+		v1ObjectsUndecodable: 1,
+		matched:              2,
+		mismatched:           2,
+		mappingsMissing:      2,
+		errored:              2,
 	}
 	if res != want {
 		t.Errorf("counters = %+v\nwant %+v", res, want)
@@ -163,7 +165,7 @@ func TestReconcileCommitteeMemberVotingJoinAmbiguous(t *testing.T) {
 		reconcileTestRecordA: []byte(`{"collaboration_name__c":"` + reconcileTestCommittee + `","contact_name__c":"` + reconcileTestContactA + `","voting_status__c":"Voting Rep"}`),
 		reconcileTestRecordB: []byte(`{"collaboration_name__c":"` + reconcileTestCommittee + `","contact_name__c":"` + reconcileTestContactA + `","voting_status__c":"Observer"}`),
 	}
-	idx, _ := buildV1MemberVotingIndex(objects)
+	idx := buildV1MemberVotingIndex(t.Context(), objects, &reconcileCommitteeMemberVotingResult{})
 	member := map[string][]byte{"m1": []byte(`{"uid":"m1","committee_uid":"cu","voting":{"status":""}}`)}
 	tests := []struct {
 		name    string
@@ -293,23 +295,23 @@ func TestReconcileCommitteeMemberVotingCreateMapping(t *testing.T) {
 	ctx := t.Context()
 
 	res := reconcileCommitteeMemberVotingResult{}
-	if !createReconcileMapping(ctx, "k.new", "v", &res) || res.mappingsBackfilled != 1 {
+	if !createReconcileMapping(ctx, "k.new", "v", nil, &res) || res.mappingsBackfilled != 1 {
 		t.Fatalf("absent key: res = %+v", res)
 	}
-	if !createReconcileMapping(ctx, "k.new", "v", &res) || res.mappingsBackfilled != 1 || res.mappingConflicts != 0 {
+	if !createReconcileMapping(ctx, "k.new", "v", nil, &res) || res.mappingsBackfilled != 1 || res.mappingConflicts != 0 {
 		t.Fatalf("same value: res = %+v", res)
 	}
 	if _, err := store.Put(ctx, "k.other", []byte("someone-else")); err != nil {
 		t.Fatal(err)
 	}
-	if createReconcileMapping(ctx, "k.other", "v", &res) || res.mappingConflicts != 1 {
+	if createReconcileMapping(ctx, "k.other", "v", nil, &res) || res.mappingConflicts != 1 {
 		t.Fatalf("different value: res = %+v", res)
 	}
 	if entry, _ := store.Get(ctx, "k.other"); string(entry.Value) != "someone-else" {
 		t.Errorf("conflicting key was overwritten: %q", entry.Value)
 	}
 	store.nextGetErr = errors.New("store unavailable")
-	if createReconcileMapping(ctx, "k.other", "v", &res) || res.errored != 1 || res.mappingConflicts != 1 {
+	if createReconcileMapping(ctx, "k.other", "v", nil, &res) || res.errored != 1 || res.mappingConflicts != 1 {
 		t.Fatalf("read-back failure: res = %+v", res)
 	}
 }
@@ -497,6 +499,101 @@ func TestReconcileCommitteeMemberVotingForeignOwnerNotPatched(t *testing.T) {
 			}
 			if res.patched != 0 || res.mappingConflicts != 1 || res.errored != 0 {
 				t.Errorf("counters = %+v; want patched=0 mapping_conflicts=1 errored=0", res)
+			}
+		})
+	}
+}
+
+func TestForwardMappingNamesMember(t *testing.T) {
+	tests := []struct {
+		value string
+		want  bool
+	}{
+		{value: "cu:m1", want: true},
+		{value: "m1", want: true}, // legacy bare member UID
+		{value: "cu:other", want: false},
+		{value: "other", want: false},
+		{value: "cx:m1", want: false},
+		{value: tombstoneMarker, want: false},
+		{value: "", want: false},
+	}
+	for _, tt := range tests {
+		if got := forwardMappingNamesMember(tt.value, "cu", "m1"); got != tt.want {
+			t.Errorf("forwardMappingNamesMember(%q) = %v, want %v", tt.value, got, tt.want)
+		}
+	}
+}
+
+func TestReconcileCommitteeMemberVotingLegacyForwardMapping(t *testing.T) {
+	reconcileTestLogger(t)
+	origFetch, origGet, origUpdate := reconcileFetchCommitteeMemberFn, reconcileGetV1ObjectFn, reconcileUpdateV1MemberFn
+	t.Cleanup(func() {
+		reconcileFetchCommitteeMemberFn, reconcileGetV1ObjectFn, reconcileUpdateV1MemberFn = origFetch, origGet, origUpdate
+	})
+	reconcileFetchCommitteeMemberFn = func(context.Context, string, string) (*committeeservice.CommitteeMemberFullWithReadonlyAttributes, string, error) {
+		return &committeeservice.CommitteeMemberFullWithReadonlyAttributes{}, "etag", nil
+	}
+	reconcileGetV1ObjectFn = func(context.Context, string) (map[string]any, bool, error) {
+		return map[string]any{"voting_status__c": "Voting Rep"}, true, nil
+	}
+
+	reverseValue := reconcileTestProject + ":" + reconcileTestCommittee + ":" + reconcileTestContactA
+	forwardKey := "committee_member.sfid." + reconcileTestRecordA
+	base := votingReconcileItem{
+		memberUID: "m1", committeeUID: "cu", reverseMapping: reverseValue, projectSFID: reconcileTestProject,
+		committeeSFID: reconcileTestCommittee, contactSFID: reconcileTestContactA, recordSFID: reconcileTestRecordA,
+		v1Status: "Voting Rep", target: v1NoVotingStatus, mismatch: true,
+	}
+	tests := []struct {
+		name           string
+		needsCompanion bool
+		wantBackfilled int
+	}{
+		{name: "companion present", needsCompanion: false, wantBackfilled: 0},
+		{name: "companion missing", needsCompanion: true, wantBackfilled: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newFakeMappingStore()
+			orig := mappingStore
+			mappingStore = store
+			t.Cleanup(func() { mappingStore = orig })
+			ctx := t.Context()
+			seed := map[string]string{
+				"committee_member.uid.m1": reverseValue,
+				forwardKey:                "m1", // legacy format: bare member UID
+			}
+			if !tt.needsCompanion {
+				seed[committeeMemberRecordSFIDKey("m1")] = reconcileTestRecordA
+			}
+			for key, value := range seed {
+				if _, err := store.Put(ctx, key, []byte(value)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var patched []string
+			reconcileUpdateV1MemberFn = func(_ context.Context, _, _, memberSFID string, payload projectServiceCommitteeMemberUpdate) error {
+				patched = append(patched, memberSFID+"="+payload.VotingStatus)
+				return nil
+			}
+
+			item := base
+			item.needsCompanion, item.needsForward = tt.needsCompanion, tt.needsCompanion
+			res := reconcileCommitteeMemberVotingResult{}
+			if err := applyVotingReconcileItems(ctx, []votingReconcileItem{item}, rate.NewLimiter(rate.Inf, 1), "committee_member.sfid.", "platform-community__c.", &res); err != nil {
+				t.Fatalf("applyVotingReconcileItems: %v", err)
+			}
+			if res.patched != 1 || res.mappingConflicts != 0 || res.errored != 0 || res.mappingsBackfilled != tt.wantBackfilled {
+				t.Errorf("counters = %+v; want patched=1 mapping_conflicts=0 errored=0 mappings_backfilled=%d", res, tt.wantBackfilled)
+			}
+			if want := reconcileTestContactA + "=" + v1NoVotingStatus; len(patched) != 1 || patched[0] != want {
+				t.Errorf("PATCHes = %v, want [%s]", patched, want)
+			}
+			if entry, err := store.Get(ctx, forwardKey); err != nil || string(entry.Value) != "m1" {
+				t.Errorf("legacy forward mapping = %q, %v; want it left as %q", entry.Value, err, "m1")
+			}
+			if entry, err := store.Get(ctx, committeeMemberRecordSFIDKey("m1")); err != nil || string(entry.Value) != reconcileTestRecordA {
+				t.Errorf("companion = %q, %v; want %q", entry.Value, err, reconcileTestRecordA)
 			}
 		})
 	}
