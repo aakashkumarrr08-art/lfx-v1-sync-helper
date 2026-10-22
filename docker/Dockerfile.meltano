@@ -38,7 +38,9 @@ ENV MELTANO_CLI_DISABLE_VERSION_CHECK=1
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=uv.lock,target=uv.lock \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
-    cd meltano && uv run meltano install --parallelism=1
+    cd meltano && \
+    uv run meltano install tap-postgres target-nats-kv --parallelism=1 && \
+    UV_OVERRIDE=/app/meltano/uv-overrides.txt uv run meltano install tap-dynamodb --parallelism=1
 
 # Runtime stage with minimal dependencies.
 FROM python:3.12.12-slim-trixie
