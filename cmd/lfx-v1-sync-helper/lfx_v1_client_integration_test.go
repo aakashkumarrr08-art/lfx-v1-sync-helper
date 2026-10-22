@@ -151,27 +151,75 @@ func TestCommitteeMemberClientIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("createV1CommitteeMember: %v", err)
 	}
-	t.Logf("created member: ID=%s Email=%s", member.ID, member.Email)
+	t.Logf("created member: ID=%s MemberID=%s Email=%s VotingStatus=%q (omitted on create)",
+		member.ID, member.MemberID, member.Email, member.VotingStatus)
 
 	if member.ID == "" {
 		t.Fatal("expected non-empty member ID in create response")
 	}
+	// ID is the platform-community__c record SFID; MemberID is the contact SFID,
+	// which is also the path identifier the v1 PATCH/DELETE member endpoints expect.
+	// The v2→v1 create keys its forward mapping on ID, so the two must differ.
+	if member.ID == member.MemberID {
+		t.Errorf("expected record ID %q to differ from contact MemberID", member.ID)
+	}
+	if member.VotingStatus != v1NoVotingStatus {
+		t.Logf("note: omitted VotingStatus defaulted to %q, not %q", member.VotingStatus, v1NoVotingStatus)
+	}
 
 	// Always clean up the member, even if the update step fails.
 	t.Cleanup(func() {
-		if err := deleteV1CommitteeMember(ctx, integrationTestProjectSFID, committee.ID, member.ID); err != nil {
+		if err := deleteV1CommitteeMember(ctx, integrationTestProjectSFID, committee.ID, member.MemberID); err != nil {
 			t.Errorf("deleteV1CommitteeMember cleanup: %v", err)
 		} else {
-			t.Logf("deleted member %s", member.ID)
+			t.Logf("deleted member %s", member.MemberID)
 		}
 	})
 
 	// --- Update member ---
-	if err := updateV1CommitteeMember(ctx, integrationTestProjectSFID, committee.ID, member.ID, projectServiceCommitteeMemberUpdate{
+	if err := updateV1CommitteeMember(ctx, integrationTestProjectSFID, committee.ID, member.MemberID, projectServiceCommitteeMemberUpdate{
 		Role:   "Chair",
 		Status: "Active",
 	}); err != nil {
 		t.Fatalf("updateV1CommitteeMember: %v", err)
 	}
-	t.Logf("updated member %s", member.ID)
+	t.Logf("updated member %s", member.MemberID)
+
+	// --- Explicit "no voting status" value (create, then PATCH round trip) ---
+	// v1 rejects "None" on POST/PATCH (422), so v2's empty status is sent as
+	// v1NoVotingStatus ("Observer"), the non-eligible v1 value.
+	observer, err := createV1CommitteeMember(ctx, integrationTestProjectSFID, committee.ID, projectServiceCommitteeMemberCreate{
+		Email:        "integration-test-voting-observer@example.com",
+		FirstName:    "Integration",
+		LastName:     "VotingObserver",
+		Role:         "None",
+		Status:       "Active",
+		VotingStatus: v1NoVotingStatus,
+	})
+	if err != nil {
+		t.Fatalf("createV1CommitteeMember (VotingStatus=%s): %v", v1NoVotingStatus, err)
+	}
+	t.Logf("created member with explicit %s: ID=%s MemberID=%s VotingStatus=%q",
+		v1NoVotingStatus, observer.ID, observer.MemberID, observer.VotingStatus)
+
+	t.Cleanup(func() {
+		if err := deleteV1CommitteeMember(ctx, integrationTestProjectSFID, committee.ID, observer.MemberID); err != nil {
+			t.Errorf("deleteV1CommitteeMember cleanup (VotingStatus=%s): %v", v1NoVotingStatus, err)
+		} else {
+			t.Logf("deleted member %s", observer.MemberID)
+		}
+	})
+
+	if observer.VotingStatus != v1NoVotingStatus {
+		t.Errorf("expected VotingStatus %q in create response, got %q", v1NoVotingStatus, observer.VotingStatus)
+	}
+
+	for _, status := range []string{"Voting Rep", v1NoVotingStatus} {
+		if err := updateV1CommitteeMember(ctx, integrationTestProjectSFID, committee.ID, observer.MemberID, projectServiceCommitteeMemberUpdate{
+			VotingStatus: status,
+		}); err != nil {
+			t.Fatalf("updateV1CommitteeMember (VotingStatus=%s): %v", status, err)
+		}
+		t.Logf("updated member %s VotingStatus=%q", observer.MemberID, status)
+	}
 }

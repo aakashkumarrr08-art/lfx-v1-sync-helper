@@ -551,6 +551,9 @@ func syncCommitteeDeleteToV1(ctx context.Context, committeeUID, projectSFID, com
 	return nil
 }
 
+// resolveV1UserSFIDByEmailFn is injectable for tests.
+var resolveV1UserSFIDByEmailFn = ResolveV1UserSFIDByEmail
+
 // syncCommitteeMemberCreateToV1 ensures a v2-created committee member exists in v1.
 // Returns a non-nil error only for transient V1 API failures; mapping write failures
 // are logged as warnings since the V1 record was already created successfully.
@@ -602,16 +605,12 @@ func syncCommitteeMemberCreateToV1(ctx context.Context, memberUID, committeeUID,
 	if country, ok := data["country"].(string); ok {
 		payload.Country = country
 	}
-	if voting, ok := data["voting"].(map[string]any); ok {
-		if vs, ok := voting["status"].(string); ok {
-			payload.VotingStatus = vs
-		}
-		if vsd, ok := voting["start_date"].(string); ok {
-			payload.VotingStartDate = vsd
-		}
-		if ved, ok := voting["end_date"].(string); ok {
-			payload.VotingEndDate = ved
-		}
+	// An empty v2 voting status is sent explicitly (v1NoVotingStatus) so v1
+	// does not apply its own default; an absent "voting" key leaves it unset.
+	if vs, vsd, ved, present := v1VotingFromV2EventData(data); present {
+		payload.VotingStatus = vs
+		payload.VotingStartDate = vsd
+		payload.VotingEndDate = ved
 	}
 	orgID, err := resolveOrgIDFromEventData(ctx, data)
 	if err != nil {
@@ -623,7 +622,7 @@ func syncCommitteeMemberCreateToV1(ctx context.Context, memberUID, committeeUID,
 
 	// Attempt to resolve the v1 user SFID by email to populate MemberID.
 	// This links the committee member to an existing v1 platform user if one exists.
-	userSFID, err := ResolveV1UserSFIDByEmail(ctx, email)
+	userSFID, err := resolveV1UserSFIDByEmailFn(ctx, email)
 	if err != nil {
 		return err // transient: database unavailable, redeliver
 	}
@@ -638,26 +637,50 @@ func syncCommitteeMemberCreateToV1(ctx context.Context, memberUID, committeeUID,
 		return err // transient: trigger redeliver
 	}
 
-	// Store forward mapping (v1 SFID -> committeeUID:memberUID) and reverse mapping (v2 UID -> projectSFID:committeeSFID:memberSFID).
+	// Store forward mapping (v1 record SFID -> committeeUID:memberUID) and reverse mapping (v2 UID -> projectSFID:committeeSFID:memberSFID).
 	//
-	// Both writes use putMappingWithRetry (handlers.go): the v1 record already
-	// exists, and losing either mapping is a durable inconsistency because core
+	// All writes use putMappingWithRetry (handlers.go): the v1 record already
+	// exists, and losing any mapping is a durable inconsistency because core
 	// NATS will not redeliver this create event.
 	//
-	// The reverse mapping is the more critical of the two: it doubles as the
-	// create-path loop guard and drives the SFID triple lookup for subsequent
-	// update/delete events. Losing it means a replay would create a duplicate v1
-	// committee member and any future v2 update / delete would be silently
-	// dropped. Its failure is escalated to ERROR with the SFID + UID so ops can
-	// reconcile manually.
+	// The forward mapping is keyed on the platform-community__c record SFID
+	// (result.ID), the sfid the WAL emits for later v1 edits and deletes, so
+	// those resolve through handleCommitteeMemberUpdate's update branch instead
+	// of missing the mapping (lfx-self-serve#4079). The record-sfid companion is
+	// written first, mirroring the companion-first ordering in
+	// handleCommitteeMemberUpdate: if it fails, the forward mapping falls back
+	// to the contact-SFID key that syncCommitteeMemberDeleteToV1 can still
+	// resolve without a companion. When result.ID is empty, the contact SFID is
+	// used and no companion is written.
+	//
+	// The reverse mapping is the most critical: it doubles as the create-path
+	// loop guard and drives the SFID triple lookup for subsequent update/delete
+	// events. Losing it means a replay would create a duplicate v1 committee
+	// member and any future v2 update / delete would be silently dropped. Its
+	// failure is escalated to ERROR with the SFID + UID so ops can reconcile
+	// manually. It is always written, whatever happened to the companion.
 	memberSFID := result.MemberID
+	forwardSFID := memberSFID
+	if recordSFID := result.ID; recordSFID != "" {
+		if err := putMappingWithRetry(ctx, committeeMemberRecordSFIDKey(memberUID), []byte(recordSFID)); err != nil {
+			if errors.Is(err, errPutRaceAbortedByTombstone) {
+				log.With(errKey, err, "record_sfid", recordSFID).
+					InfoContext(ctx, "committee member record sfid mapping write aborted — delete raced with create; v1 record already deleted, mapping tombstoned, final state consistent")
+			} else {
+				log.With(errKey, err, "record_sfid", recordSFID).
+					ErrorContext(ctx, "failed to store committee member record sfid mapping after v1 create — falling back to the contact-SFID forward mapping key; v1 edits of this member will not reach v2 until reconciled")
+			}
+		} else {
+			forwardSFID = recordSFID
+		}
+	}
 	forwardMappingValue := committeeUID + ":" + memberUID
-	if err := putMappingWithRetry(ctx, "committee_member.sfid."+memberSFID, []byte(forwardMappingValue)); err != nil {
+	if err := putMappingWithRetry(ctx, "committee_member.sfid."+forwardSFID, []byte(forwardMappingValue)); err != nil {
 		if errors.Is(err, errPutRaceAbortedByTombstone) {
-			log.With(errKey, err, "member_sfid", memberSFID).
+			log.With(errKey, err, "member_sfid", memberSFID, "forward_sfid", forwardSFID).
 				InfoContext(ctx, "committee member forward mapping write aborted — delete raced with create; v1 record already deleted, mapping tombstoned, final state consistent")
 		} else {
-			log.With(errKey, err, "member_sfid", memberSFID).
+			log.With(errKey, err, "member_sfid", memberSFID, "forward_sfid", forwardSFID).
 				ErrorContext(ctx, "failed to store committee member forward mapping after v1 create — lookup_v1_mapping may return stale results until reconciled")
 		}
 	}
@@ -672,7 +695,7 @@ func syncCommitteeMemberCreateToV1(ctx context.Context, memberUID, committeeUID,
 		}
 	}
 
-	log.With("member_sfid", memberSFID).InfoContext(ctx, "successfully created committee member in v1 from indexer event")
+	log.With("member_sfid", memberSFID, "forward_sfid", forwardSFID).InfoContext(ctx, "successfully created committee member in v1 from indexer event")
 	return nil
 }
 
@@ -710,16 +733,12 @@ func syncCommitteeMemberUpdateToV1(ctx context.Context, memberUID, projectSFID, 
 	if country, ok := data["country"].(string); ok {
 		payload.Country = country
 	}
-	if voting, ok := data["voting"].(map[string]any); ok {
-		if vs, ok := voting["status"].(string); ok {
-			payload.VotingStatus = vs
-		}
-		if vsd, ok := voting["start_date"].(string); ok {
-			payload.VotingStartDate = vsd
-		}
-		if ved, ok := voting["end_date"].(string); ok {
-			payload.VotingEndDate = ved
-		}
+	// A cleared v2 voting status is sent as v1NoVotingStatus because v1 cannot
+	// clear the field; an absent "voting" key leaves v1 untouched.
+	if vs, vsd, ved, present := v1VotingFromV2EventData(data); present {
+		payload.VotingStatus = vs
+		payload.VotingStartDate = vsd
+		payload.VotingEndDate = ved
 	}
 	orgID, err := resolveOrgIDFromEventData(ctx, data)
 	if err != nil {
@@ -746,9 +765,9 @@ func syncCommitteeMemberUpdateToV1(ctx context.Context, memberUID, projectSFID, 
 // for the same record does not find a stale mapping and retry deleting the
 // already-removed v2 member.
 //
-// recordSFID is empty both for members created via the v2->v1 create path
-// (syncCommitteeMemberCreateToV1 — those key their forward mapping on the contact
-// SFID itself, there being no distinct record sfid) and for v1-originated members
+// recordSFID is empty for members created via the v2->v1 create path before
+// lfx-self-serve#4079 (or whose create could not write the companion — both key
+// their forward mapping on the contact SFID itself) and for v1-originated members
 // whose record-sfid companion key is missing or unreadable. Since those two cases
 // are indistinguishable from recordSFID alone, memberSFID is only used as the
 // forward-tombstone key when the "committee_member.sfid.<memberSFID>" mapping

@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -247,5 +248,130 @@ func TestIndexerSyncSkipsUnmappedAndUnknownEvents(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestSyncCommitteeMemberCreateToV1 covers the v2→v1 member create for
+// lfx-self-serve#4079: an empty v2 voting status is sent as v1NoVotingStatus,
+// and the forward mapping is keyed on the platform-community__c record SFID
+// (with its companion key) so later v1 edits resolve to the v2 member.
+func TestSyncCommitteeMemberCreateToV1(t *testing.T) {
+	const (
+		memberUID     = "member-uid"
+		committeeUID  = "committee-uid"
+		projectSFID   = "project-sfid"
+		committeeSFID = "committee-sfid"
+		recordSFID    = "11111111-2222-3333-4444-555555555555"
+		contactSFID   = "lfContactSFID00001"
+	)
+	path := "/project-service/v2/projects/" + projectSFID + "/committees/" + committeeSFID + "/members"
+
+	origResolve := resolveV1UserSFIDByEmailFn
+	t.Cleanup(func() { resolveV1UserSFIDByEmailFn = origResolve })
+	resolveV1UserSFIDByEmailFn = func(context.Context, string) (string, error) { return "", nil }
+
+	tests := []struct {
+		name           string
+		response       string
+		data           map[string]any
+		wantVoting     any // nil means VotingStatus must be absent from the body
+		wantForwardKey string
+		wantCompanion  bool
+	}{
+		{
+			name:           "empty voting status sends Observer and record-keyed mappings",
+			response:       `{"ID":"` + recordSFID + `","MemberID":"` + contactSFID + `"}`,
+			data:           map[string]any{"email": "m@example.com", "voting": map[string]any{"status": ""}},
+			wantVoting:     v1NoVotingStatus,
+			wantForwardKey: "committee_member.sfid." + recordSFID,
+			wantCompanion:  true,
+		},
+		{
+			name:           "empty create ID falls back to the contact SFID forward key",
+			response:       `{"ID":"","MemberID":"` + contactSFID + `"}`,
+			data:           map[string]any{"email": "m@example.com", "voting": map[string]any{"status": ""}},
+			wantVoting:     v1NoVotingStatus,
+			wantForwardKey: "committee_member.sfid." + contactSFID,
+		},
+		{
+			name:           "explicit status is passed through",
+			response:       `{"ID":"` + recordSFID + `","MemberID":"` + contactSFID + `"}`,
+			data:           map[string]any{"email": "m@example.com", "voting": map[string]any{"status": "Voting Rep"}},
+			wantVoting:     "Voting Rep",
+			wantForwardKey: "committee_member.sfid." + recordSFID,
+			wantCompanion:  true,
+		},
+		{
+			name:           "absent voting key leaves VotingStatus unset",
+			response:       `{"ID":"` + recordSFID + `","MemberID":"` + contactSFID + `"}`,
+			data:           map[string]any{"email": "m@example.com"},
+			wantForwardKey: "committee_member.sfid." + recordSFID,
+			wantCompanion:  true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := setupSyncTest(t, http.StatusOK, tt.response)
+			if err := syncCommitteeMemberCreateToV1(t.Context(), memberUID, committeeUID, projectSFID, committeeSFID, tt.data); err != nil {
+				t.Fatalf("syncCommitteeMemberCreateToV1: %v", err)
+			}
+
+			requests := h.recordedRequests()
+			if len(requests) != 1 || requests[0].Method != http.MethodPost || requests[0].Path != path {
+				t.Fatalf("requests = %+v; want one POST %s", requests, path)
+			}
+			got, present := requests[0].Body["VotingStatus"]
+			if tt.wantVoting == nil {
+				if present {
+					t.Errorf("VotingStatus = %v; want it absent", got)
+				}
+			} else if got != tt.wantVoting {
+				t.Errorf("VotingStatus = %v; want %v", got, tt.wantVoting)
+			}
+
+			h.assertMapping(t, tt.wantForwardKey, committeeUID+":"+memberUID)
+			h.assertMapping(t, "committee_member.uid."+memberUID, projectSFID+":"+committeeSFID+":"+contactSFID)
+			if tt.wantCompanion {
+				h.assertMapping(t, committeeMemberRecordSFIDKey(memberUID), recordSFID)
+			} else if _, err := h.store.Get(t.Context(), committeeMemberRecordSFIDKey(memberUID)); !errors.Is(err, ErrKeyNotFound) {
+				t.Errorf("companion key present (err=%v); want ErrKeyNotFound", err)
+			}
+		})
+	}
+}
+
+// TestSyncCommitteeMemberUpdateToV1Voting verifies that a cleared v2 voting
+// status is PATCHed to v1 as v1NoVotingStatus, and that an event without a
+// voting key leaves VotingStatus out of the PATCH body.
+func TestSyncCommitteeMemberUpdateToV1Voting(t *testing.T) {
+	tests := []struct {
+		name       string
+		data       map[string]any
+		wantVoting any // nil means VotingStatus must be absent from the body
+	}{
+		{"cleared status", map[string]any{"voting": map[string]any{"status": ""}}, v1NoVotingStatus},
+		{"None status", map[string]any{"voting": map[string]any{"status": "None"}}, v1NoVotingStatus},
+		{"real status", map[string]any{"voting": map[string]any{"status": "Alternate Voting Rep"}}, "Alternate Voting Rep"},
+		{"absent voting key", map[string]any{"job_title": "Engineer"}, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := setupSyncTest(t, http.StatusOK, `{}`)
+			if err := syncCommitteeMemberUpdateToV1(t.Context(), "member-uid", "project-sfid", "committee-sfid", "lfContactSFID00001", tt.data); err != nil {
+				t.Fatalf("syncCommitteeMemberUpdateToV1: %v", err)
+			}
+			requests := h.recordedRequests()
+			if len(requests) != 1 || requests[0].Method != http.MethodPatch {
+				t.Fatalf("requests = %+v; want one PATCH", requests)
+			}
+			got, present := requests[0].Body["VotingStatus"]
+			if tt.wantVoting == nil {
+				if present {
+					t.Errorf("VotingStatus = %v; want it absent", got)
+				}
+			} else if got != tt.wantVoting {
+				t.Errorf("VotingStatus = %v; want %v", got, tt.wantVoting)
+			}
+		})
 	}
 }

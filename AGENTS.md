@@ -152,6 +152,16 @@ Boot ordering (`main.go`): NATS + KV bucket handles → a KV-backed `mappingStor
 
 **Chart wiring.** The Postgres cluster is provisioned by `charts/lfx-v1-sync-helper/templates/database.yaml`, selected via `.Values.database.mode` (`external` | `database` | `cluster+database`). The app deployment forwards CNPG operator-managed `<clusterName>-app` Secret keys (or external Secret keys, or a single-key `V1_MAPPINGS_DATABASE_URL`) as `V1_MAPPINGS_*` env vars (distinct from `V1_DB_*`, which addresses the read-only Salesforce replica) and the service composes the libpq DSN in-process via `Config.ResolveV1MappingsDatabaseURL` — never as a literal env-var value, to avoid leaking the password through `kubectl describe pod`. When `database.mode=external` with no `secretName`, the deployment injects `V1_MAPPINGS_STORE_MODE=kv` automatically so a chart install without Postgres wiring still boots. Setting `.Values.app.environment.V1_MAPPINGS_STORE_MODE.value` overrides that safety fallback.
 
+#### Committee member voting status — lfx-self-serve#4079
+
+- **"No voting status" is normalized at both sync boundaries** (`voting_status.go`). v2 represents it as an empty status. v1 may hold `""` or a legacy `"None"`, but v1 project-service POST/PATCH only accept `Alternate Voting Rep | Observer | Voting Rep | Emeritus` (`"None"` → 422) and cannot clear the field. An omitted status gets a v1-side default.
+- **v2 → v1** (`syncCommitteeMemberCreateToV1` / `syncCommitteeMemberUpdateToV1` via `v1VotingFromV2EventData`): an empty, `null` or `"None"` v2 status is sent as an explicit `VotingStatus: "Observer"` (`v1NoVotingStatus`), the only non-eligible value v1 accepts. An indexer event without a `voting` key leaves `VotingStatus` unset.
+- **v1 → v2** (`mapV1DataToCommitteeMember{Create,Update}Payload`): `"None"` (case-insensitive) or empty maps to a nil `Voting`. `"Observer"` stays `"Observer"`, because it is a real v2 status. `committeeMembersEqual` compares voting status through `normalizeVotingStatus`, so nil, `""` and `"None"` are equal.
+- **Forward mapping for members created in Self Serve:** `syncCommitteeMemberCreateToV1` now keys `committee_member.sfid.<sfid>` on the create response's `ID` (the `platform-community__c` record SFID, the sfid the WAL emits), not on `MemberID` (the contact SFID). It writes the `committee_member.record_sfid.<uid>` companion first. Later v1 edits and deletes of the member therefore resolve to the v2 member.
+  - If the companion write fails, or `ID` is empty, it falls back to the contact-SFID forward key. The reverse mapping (`projectSFID:committeeSFID:contactSFID`) is always written.
+  - The v1 PATCH/DELETE member endpoints take the contact SFID (`MemberID`) as the path id, not `ID`.
+  - Members created before this change are repaired by `--reconcile-committee-member-voting`.
+
 ### Python ETL (Meltano)
 
 #### Configuration Structure
@@ -390,6 +400,24 @@ Re-emits v1 `platform-collaboration__c` rows that have no live `committee.sfid.*
 - **Dry-run**: validates candidate selection only; it cannot observe the downstream create. Reports the full candidate/skip counters, including `name_conflicts` when `--check-committee-names` is passed and `duplicate_names`.
 - **Summary log fields**: `scanned`, `mappings_live`, `mappings_tombstoned`, `low_mappings_count`, `candidates`, `emitted`, `remaining_unmapped`, `errors`, plus the `skipped_*` breakdown (`skipped_already_mapped`, `skipped_tombstoned`, `skipped_soft_deleted`, `skipped_empty_value`, `skipped_undecodable`, `skipped_no_sfid`, `skipped_missing_required`, `skipped_v2_authored`, `skipped_parent_unmapped`, `skipped_revision_race`, `skipped_limit`, `skipped_missing`, `skipped_settle_timeout`, `skipped_name_conflict`), `name_conflicts` (count of `res.nameConflicts`), and `duplicate_names` (count of `res.duplicateNames`) (shared via `backfillCommitteesResult.logFields()`). `remaining_unmapped` is recomputed from final settle state at the end of a live run.
 - **Manifest**: `manifests/backfill-committees-job.yaml`, shipped dry-run by default with `--check-committee-names`. `--check-committee-names` is always on in the shipped Job for the same reason `--check-slugs` is always on for projects: a committee created successfully but whose mapping write then silently fails would look unmapped to a rerun and be re-emitted as a duplicate create. **Deployment-order prerequisite**: since `--check-committee-names` is always on, this manifest must not be applied until `lfx-v2-committee-service` PR #209 (which adds the `lfx.committee-api.name_to_uid` subject the check depends on) is merged and deployed to the target environment — otherwise every lookup gets "no responders" and the job (including a dry run) hard-errors before reporting any counters. This is an operational ordering note, not a code gate.
+
+### `--reconcile-committee-member-voting [--dry-run]` (`reconcile_committee_member_voting.go`)
+
+Reconciles committee member voting status between v2 (Self Serve) and v1 (lfx-self-serve#4079). Vote eligibility is decided from the v1 roster: itx-service-voting's default filter is "Voting Rep" only. So a member whose v1 status drifted from the Self Serve roster can be invited to, or left out of, votes. **v2 wins.**
+
+- **Sources:** three `ScanSubjectData` scans with `cfg.NATSFetchMaxWait`:
+  - `KV_committee-members` (`$KV.committee-members.*`, skipping `lookup/` keys);
+  - `KV_v1-mappings` for `committee_member.uid.*` (reverse) and `committee_member.record_sfid.*` (companion);
+  - `KV_v1-objects` (`$KV.v1-objects.platform-community__c.*`, soft-deleted rows excluded).
+- **Join:** member UID → reverse mapping → `collaboration_name__c + ":" + contact_name__c`. Legacy reverse mappings that store the record SFID join on the record key instead. More than one live v1 record for the same committee + contact is counted as `ambiguous_v1_record` and skipped.
+- **Classifier** (`classifyVotingReconcile`): an empty v2 status matches a v1 `""`, `"None"` or `"Observer"`; any other v1 value is a mismatch with target `"Observer"`. A non-empty v2 status must equal v1 (case-insensitive), otherwise the target is the v2 status.
+- **Live run:** each mismatch is paced by `--emit-rate` (default 2/s).
+  - Before writing, the live v2 member (`fetchCommitteeMember`) and v1 record (`getV1ObjectData`) are re-read. If they now agree, the write is skipped and counted as `skipped_now_equal`.
+  - Otherwise v1 gets `PATCH {VotingStatus: target}` on the contact-SFID path. The WAL echo is dropped by `shouldSkipSync`.
+- **Mapping backfill (live run only):** members with no `committee_member.record_sfid.<uid>` companion get the companion and the record-keyed forward mapping `committee_member.sfid.<recordSFID>` = `committeeUID:memberUID`. Writes use `mappingStore.Create`, so an existing key is never overwritten. A key that already holds a different value counts as `mapping_conflicts`. The forward key is checked first, and a conflict there skips the companion too, so a later v2 delete cannot tombstone another member's forward mapping. A pre-#4079 contact-SFID forward key is left in place.
+- **Dry-run:** reports every mismatch and missing mapping, logging member UID, record SFID, both statuses and the target. It writes nothing.
+- **Summary log fields** (`reconcileCommitteeMemberVotingResult.logFields()`): `dry_run`, `inspected`, `no_mapping`, `poisoned_mapping`, `no_v1_record`, `ambiguous_v1_record`, `v1_objects_undecodable`, `matched`, `mismatched`, `patched`, `skipped_now_equal`, `mappings_missing`, `mappings_backfilled` (mapping keys created), `mapping_conflicts`, `errored`.
+- **Manifest:** `manifests/reconcile-committee-member-voting-job.yaml`, shipped with `--dry-run`. It sets `LFX_API_GW` explicitly, because the default is the dev gateway. Expected sequence: dry run, live run, then a second dry run that should report `mismatched=0`.
 
 ### `--sync-user <username> [--dry-run]` (`backfill_email_profile.go`)
 

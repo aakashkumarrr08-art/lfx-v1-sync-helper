@@ -305,15 +305,24 @@ func committeeMembersEqual(current *committeeservice.CommitteeMemberFullWithRead
 		return false
 	}
 
-	// Compare voting information.
+	// Compare voting information. A nil Voting, an empty status and "None" all
+	// mean "no voting status", so a legacy v2 "None" against an incoming nil is
+	// not a change. Dates are compared only when both sides carry voting info.
+	var currentVotingStatus, updateVotingStatus string
+	if current.Voting != nil {
+		currentVotingStatus = current.Voting.Status
+	}
+	if update.Voting != nil {
+		updateVotingStatus = update.Voting.Status
+	}
+	if normalizeVotingStatus(currentVotingStatus) != normalizeVotingStatus(updateVotingStatus) {
+		return false
+	}
 	if current.Voting != nil && update.Voting != nil {
-		if current.Voting.Status != update.Voting.Status ||
-			stringPtrToString(current.Voting.StartDate) != stringPtrToString(update.Voting.StartDate) ||
+		if stringPtrToString(current.Voting.StartDate) != stringPtrToString(update.Voting.StartDate) ||
 			stringPtrToString(current.Voting.EndDate) != stringPtrToString(update.Voting.EndDate) {
 			return false
 		}
-	} else if current.Voting != update.Voting {
-		return false
 	}
 
 	// Compare organization information.

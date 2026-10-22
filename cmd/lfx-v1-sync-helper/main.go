@@ -82,19 +82,20 @@ func main() {
 	var doBackfillWorkspaces = flag.Bool("backfill-workspaces", false, "backfill legacy workspaces into v2 member-service, then exit")
 	var doBackfillCommitteeMemberMappings = flag.Bool("backfill-committee-member-mappings", false, "repair committee-member reverse mappings that store the record sfid instead of the contact SFID, then exit")
 	var doBackfillCommitteeMemberNames = flag.Bool("backfill-committee-member-names", false, "populate first_name/last_name on V2 committee members that have no name (members without an LFX account at sync time), then exit")
+	var doReconcileCommitteeMemberVoting = flag.Bool("reconcile-committee-member-voting", false, "reconcile V2 committee member voting status into v1 (v2 wins) and backfill missing record-sfid member mappings, then exit")
 	var doBackfillV1MappingsToPG = flag.Bool("backfill-v1-mappings-to-postgres", false, "copy the v1-mappings NATS KV bucket into the Postgres v1_mappings table, then exit (LFXV2-2985)")
 	var doBackfillProjects = flag.Bool("backfill-projects", false, "re-emit v1 projects that have no v2 mapping so the running deployment creates them, then exit")
 	var doBackfillCommittees = flag.Bool("backfill-committees", false, "re-emit v1 committees that have no v2 mapping so the running deployment creates them, then exit")
 	var excludeStagePrefix = flag.String("exclude-stage-prefix", "", "comma-separated, case-insensitive project_status__c prefixes to exclude (applicable with --backfill-projects)")
 	var includeStagePrefix = flag.String("include-stage-prefix", "", "comma-separated, case-insensitive project_status__c prefixes to include exclusively (applicable with --backfill-projects)")
-	var emitRate = flag.Float64("emit-rate", 2.0, "maximum record re-emits per second (applicable with --backfill-projects and --backfill-committees)")
+	var emitRate = flag.Float64("emit-rate", 2.0, "maximum record re-emits (or v1 PATCHes) per second (applicable with --backfill-projects, --backfill-committees, and --reconcile-committee-member-voting)")
 	var allowFormation = flag.Bool("allow-formation", false, "allow formation-staged projects in the same run as non-formation projects (applicable with --backfill-projects)")
 	var checkSlugs = flag.Bool("check-slugs", false, "skip candidates whose slug already resolves to a v2 project (applicable with --backfill-projects)")
 	var checkCommitteeNames = flag.Bool("check-committee-names", false, "skip candidates whose project UID + name already resolves to a v2 committee via lfx.committee-api.name_to_uid (applicable with --backfill-committees)")
 	var forceBackfill = flag.Bool("force", false, "bypass the minimum-mappings safety floor (applicable with --backfill-projects and --backfill-committees)")
 	var syncUser = flag.String("sync-user", "", "sync profile and alternate emails for a single user by username, then exit")
 	var syncUsersFile = flag.String("sync-users-file", "", "sync profile and alternate emails for each username listed in a file (one per line), then exit")
-	var dryRun = flag.Bool("dry-run", false, "log changes without writing them (applicable with --backfill-*, --sync-user, and --sync-users-file)")
+	var dryRun = flag.Bool("dry-run", false, "log changes without writing them (applicable with --backfill-*, --reconcile-committee-member-voting, --sync-user, and --sync-users-file)")
 	var backfillLimit = flag.Int("limit", 1000, "maximum number of records (projects or committees) to process per backfill run (applicable with --backfill-projects and --backfill-committees; 0 = unlimited)")
 	var auth0Rate = flag.Float64("auth0-rate", defaultAuth0RateLimit, "users per second to pace the --sync-users-file loop")
 
@@ -124,13 +125,13 @@ func main() {
 
 	// Enforce mutual exclusion across all one-shot flags.
 	oneShotCount := 0
-	for _, b := range []bool{*doBackfillACSProject, *doBackfillACSOrg, *doBackfillWorkspaces, *syncUser != "", *syncUsersFile != "", *doBackfillCommitteeMemberMappings, *doBackfillCommitteeMemberNames, *doBackfillV1MappingsToPG, *doBackfillProjects, *doBackfillCommittees} {
+	for _, b := range []bool{*doBackfillACSProject, *doBackfillACSOrg, *doBackfillWorkspaces, *syncUser != "", *syncUsersFile != "", *doBackfillCommitteeMemberMappings, *doBackfillCommitteeMemberNames, *doReconcileCommitteeMemberVoting, *doBackfillV1MappingsToPG, *doBackfillProjects, *doBackfillCommittees} {
 		if b {
 			oneShotCount++
 		}
 	}
 	if oneShotCount > 1 {
-		fmt.Fprintln(os.Stderr, "error: --backfill-acs-project, --backfill-acs-org, --backfill-workspaces, --backfill-committee-member-mappings, --backfill-committee-member-names, --backfill-v1-mappings-to-postgres, --backfill-projects, --backfill-committees, --sync-user, and --sync-users-file are mutually exclusive")
+		fmt.Fprintln(os.Stderr, "error: --backfill-acs-project, --backfill-acs-org, --backfill-workspaces, --backfill-committee-member-mappings, --backfill-committee-member-names, --reconcile-committee-member-voting, --backfill-v1-mappings-to-postgres, --backfill-projects, --backfill-committees, --sync-user, and --sync-users-file are mutually exclusive")
 		os.Exit(2)
 	}
 
@@ -498,6 +499,20 @@ func main() {
 			"dry_run", res.dryRun,
 			"errored", res.errored,
 		).Info("committee-member name backfill completed successfully")
+		os.Exit(0)
+	}
+
+	// Handle --reconcile-committee-member-voting flag: PATCH v1 committee member
+	// voting status to match V2 (v2 wins) and backfill the record-sfid mappings
+	// of members created in Self Serve (lfx-self-serve#4079), then exit.
+	if *doReconcileCommitteeMemberVoting {
+		logger.With("dry_run", *dryRun, "emit_rate", *emitRate).Info("starting committee-member voting reconciliation")
+		res, err := reconcileCommitteeMemberVoting(ctx, reconcileCommitteeMemberVotingOpts{dryRun: *dryRun, emitRate: *emitRate})
+		if err != nil {
+			logger.With(append(res.logFields(), errKey, err)...).Error("error during committee-member voting reconciliation")
+			os.Exit(1)
+		}
+		logger.With(res.logFields()...).Info("committee-member voting reconciliation completed successfully")
 		os.Exit(0)
 	}
 
