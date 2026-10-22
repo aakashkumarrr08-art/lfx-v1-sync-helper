@@ -14,23 +14,18 @@ package main
 // durable KV consumer (kvHandler -> handleKVPut -> handleCommitteeUpdate)
 // perform the actual create. No committee-create logic is duplicated here.
 //
-// Why no depth ordering is needed here (unlike backfill_projects.go):
-// handleCommitteeUpdate's only create-path dependency is the committee's
-// parent project (project_name__c -> project.sfid.* mapping); committees do
-// not depend on other committees. This flag is meant to run after
-// --backfill-projects has finished settling, so every candidate's parent
-// project mapping is expected to already be live — candidates whose parent
-// is still unmapped are reported as skipped_parent_unmapped rather than
-// resolved level by level.
+// This historical unmapped-committee backfill does NOT order committees by
+// committee_id. Now that live creates require the parent committee mapping,
+// a child emitted before its parent can be skipped by the consumer. Do not use
+// this command to repair committee hierarchies or assume it handles nested
+// unmapped committees; use scripts/detect_committee_parent_drift.py to identify
+// discrepancies and plan a separate reviewed reconciliation.
 //
 // Why handleCommitteeUpdate drops these permanently: its parent-project miss
 // unconditionally returns false (ACK, no redelivery) rather than true
 // (NAK/redeliver) — see the "skipping committee creation - parent project
-// not found in mappings" log site. A flat re-emit is safe: unlike projects,
-// a committee's own dependents (committee members) are handled by a
-// separate mapping-key lookup that itself skips (rather than hard-errors)
-// on a missing parent committee, so no committee-side cascade exists to
-// order around.
+// not found in mappings" log site. A parent-committee miss on create also
+// skips the child, which is why flat re-emission cannot repair a hierarchy.
 //
 // Known limitation: handleCommitteeMemberUpdate has the same permanent-drop
 // bug for its own parent (committee.sfid.*) lookup miss (see

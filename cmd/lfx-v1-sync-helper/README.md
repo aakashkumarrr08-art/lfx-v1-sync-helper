@@ -196,6 +196,38 @@ The binary supports one-shot commands that exit after completing their task.
 
 The flags are independent and mutually exclusive — run each as a separate Job invocation.
 
+### Detecting committee parent drift (read-only)
+
+`scripts/detect_committee_parent_drift.py` compares three **complete**, closely
+timed CSV exports without connecting to or writing either system:
+
+- `--v1`: `committee_sfid,parent_sfid` from live `platform.collaboration__c`
+  rows (`sfid`, `committee_id`), including rows whose parent is null/empty.
+- `--v2`: `committee_uid,parent_uid` from current v2 committee bases, including
+  committees without a parent. Export the actual current bases, not index history.
+- `--mappings`: `committee_sfid,committee_uid` from **live**
+  `committee.sfid.*` v1-mappings entries; exclude tombstones (`!del`).
+
+```sh
+python3 scripts/detect_committee_parent_drift.py \
+  --v1 v1-committees.csv --v2 v2-committees.csv \
+  --mappings committee-mappings.csv > committee-parent-report.csv
+```
+
+The report includes matches, both-empty pairs, one-sided parents, different
+parents, unmapped parents/committees, and missing records. It does not choose
+which system wins; even a blank parent might be an intentional clear. Review
+conflicts and establish a source-of-truth policy **before deploying** the
+bidirectional parent writer: a subsequent full-snapshot v2 update can clear a
+v1 parent when v2 has none, even if v2 was only missing that parent due to the
+old sync omission. A v1 update carrying `committee_id` can likewise overwrite
+a conflicting v2 parent. The script contains no repair/write path. Treat
+exports and the report as operational data.
+
+The existing `--backfill-committees` command repairs *unmapped committees*,
+not parent links on already mapped committees. It does not depth-order nested
+unmapped committees, so it must not be used as a hierarchy repair command.
+
 In production, apply the Job manifest manually (not ArgoCD-managed). A dry-run pass is recommended first:
 
 ```sh
