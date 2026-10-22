@@ -208,25 +208,48 @@ func TestReconcileCommitteeMemberVotingApply(t *testing.T) {
 		return m
 	}
 
+	const owned = "cu:m1"
+	votingRep := map[string]any{"voting_status__c": "Voting Rep"}
 	tests := []struct {
-		name        string
-		liveV2      string
-		liveV1      map[string]any
-		v1Found     bool
-		updateErr   error
-		wantPatch   string // "" means no PATCH expected
-		wantPatched int
-		wantEqual   int
-		wantNoV1    int
-		wantErrored int
+		name          string
+		forward       string // live record-keyed forward mapping; "" means absent
+		forwardErr    error
+		liveV2        string
+		liveV1        map[string]any
+		v1Found       bool
+		updateErr     error
+		wantPatch     string // "" means no PATCH expected
+		wantPatched   int
+		wantEqual     int
+		wantNoV1      int
+		wantNoMapping int
+		wantConflicts int
+		wantErrored   int
 	}{
-		{name: "still mismatched patches Observer", liveV1: map[string]any{"voting_status__c": "Voting Rep"}, v1Found: true, wantPatch: v1NoVotingStatus, wantPatched: 1},
-		{name: "now equal is skipped", liveV2: "Voting Rep", liveV1: map[string]any{"voting_status__c": "Voting Rep"}, v1Found: true, wantEqual: 1},
-		{name: "v1 record gone", v1Found: false, wantNoV1: 1},
-		{name: "v1 PATCH failure is counted", liveV2: "Observer", liveV1: map[string]any{"voting_status__c": "Voting Rep"}, v1Found: true, updateErr: errors.New("boom"), wantPatch: "Observer", wantErrored: 1},
+		{name: "still mismatched patches Observer", forward: owned, liveV1: votingRep, v1Found: true, wantPatch: v1NoVotingStatus, wantPatched: 1},
+		{name: "now equal is skipped", forward: owned, liveV2: "Voting Rep", liveV1: votingRep, v1Found: true, wantEqual: 1},
+		{name: "v1 record gone", forward: owned, v1Found: false, wantNoV1: 1},
+		{name: "v1 PATCH failure is counted", forward: owned, liveV2: "Observer", liveV1: votingRep, v1Found: true, updateErr: errors.New("boom"), wantPatch: "Observer", wantErrored: 1},
+		// The forward mapping names the v2 member that owns the v1 record; no
+		// other member may PATCH it.
+		{name: "forward owned by another member is not patched", forward: "cu:other", liveV1: votingRep, v1Found: true, wantConflicts: 1},
+		{name: "tombstoned forward is not patched", forward: tombstoneMarker, liveV1: votingRep, v1Found: true, wantConflicts: 1},
+		{name: "absent forward is not patched", liveV1: votingRep, v1Found: true, wantNoMapping: 1},
+		{name: "forward read failure is not patched", forward: owned, forwardErr: errors.New("store unavailable"), liveV1: votingRep, v1Found: true, wantErrored: 1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			store := newFakeMappingStore()
+			orig := mappingStore
+			mappingStore = store
+			t.Cleanup(func() { mappingStore = orig })
+			if tt.forward != "" {
+				if _, err := store.Put(t.Context(), "committee_member.sfid."+reconcileTestRecordA, []byte(tt.forward)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			store.nextGetErr = tt.forwardErr
+
 			reconcileFetchCommitteeMemberFn = func(context.Context, string, string) (*committeeservice.CommitteeMemberFullWithReadonlyAttributes, string, error) {
 				return member(tt.liveV2), "etag", nil
 			}
@@ -249,11 +272,12 @@ func TestReconcileCommitteeMemberVotingApply(t *testing.T) {
 			}
 
 			res := reconcileCommitteeMemberVotingResult{}
-			applyVotingReconcilePatch(t.Context(), item, "platform-community__c.", &res)
+			applyVotingReconcilePatch(t.Context(), item, "committee_member.sfid.", "platform-community__c.", &res)
 			if patched != tt.wantPatch {
 				t.Errorf("PATCH VotingStatus = %q, want %q", patched, tt.wantPatch)
 			}
-			if res.patched != tt.wantPatched || res.skippedNowEqual != tt.wantEqual || res.noV1Record != tt.wantNoV1 || res.errored != tt.wantErrored {
+			if res.patched != tt.wantPatched || res.skippedNowEqual != tt.wantEqual || res.noV1Record != tt.wantNoV1 ||
+				res.noMapping != tt.wantNoMapping || res.mappingConflicts != tt.wantConflicts || res.errored != tt.wantErrored {
 				t.Errorf("counters = %+v", res)
 			}
 		})
@@ -310,14 +334,15 @@ func TestReconcileCommitteeMemberVotingBackfillMappings(t *testing.T) {
 		wantConflicts  int
 		wantNoMapping  int
 		wantErrored    int
+		wantOwned      bool
 	}{
-		{name: "absent forward writes both", reverse: reverseValue, needsCompanion: true, wantCompanion: reconcileTestRecordA, wantForward: "cu:m1", wantCreated: 2},
-		{name: "matching forward writes companion only", reverse: reverseValue, forward: "cu:m1", needsCompanion: true, wantCompanion: reconcileTestRecordA, wantForward: "cu:m1", wantCreated: 1},
+		{name: "absent forward writes both", reverse: reverseValue, needsCompanion: true, wantCompanion: reconcileTestRecordA, wantForward: "cu:m1", wantCreated: 2, wantOwned: true},
+		{name: "matching forward writes companion only", reverse: reverseValue, forward: "cu:m1", needsCompanion: true, wantCompanion: reconcileTestRecordA, wantForward: "cu:m1", wantCreated: 1, wantOwned: true},
 		{name: "forward owned by another member writes nothing", reverse: reverseValue, forward: "cu:other", needsCompanion: true, wantForward: "cu:other", wantConflicts: 1},
 		{name: "tombstoned forward writes nothing", reverse: reverseValue, forward: tombstoneMarker, needsCompanion: true, wantForward: tombstoneMarker, wantConflicts: 1},
 		// Partial write from an earlier run or the live create path: companion
 		// written, forward write failed. Only the forward key is repaired.
-		{name: "companion present repairs missing forward only", reverse: reverseValue, companion: reconcileTestRecordA, wantCompanion: reconcileTestRecordA, wantForward: "cu:m1", wantCreated: 1},
+		{name: "companion present repairs missing forward only", reverse: reverseValue, companion: reconcileTestRecordA, wantCompanion: reconcileTestRecordA, wantForward: "cu:m1", wantCreated: 1, wantOwned: true},
 		// The forward key is the ownership claim: if it cannot be written, no
 		// companion is left behind for a later v2 delete to act on.
 		{name: "forward write failure leaves no companion", reverse: reverseValue, needsCompanion: true, createErr: errors.New("store unavailable"), wantErrored: 1},
@@ -346,7 +371,9 @@ func TestReconcileCommitteeMemberVotingBackfillMappings(t *testing.T) {
 				needsCompanion: tt.needsCompanion, needsForward: true,
 			}
 			res := reconcileCommitteeMemberVotingResult{}
-			backfillReconcileMappings(ctx, item, "committee_member.sfid.", &res)
+			if owned := backfillReconcileMappings(ctx, item, "committee_member.sfid.", &res); owned != tt.wantOwned {
+				t.Errorf("owned = %v, want %v", owned, tt.wantOwned)
+			}
 
 			if companion, _ := store.Get(ctx, companionKey); string(companion.Value) != tt.wantCompanion {
 				t.Errorf("companion = %q, want %q", companion.Value, tt.wantCompanion)
@@ -373,6 +400,15 @@ func TestReconcileCommitteeMemberVotingItemTimeout(t *testing.T) {
 		reconcileMemberTimeout = origTimeout
 	})
 	reconcileMemberTimeout = 20 * time.Millisecond
+	store := newFakeMappingStore()
+	origStore := mappingStore
+	mappingStore = store
+	t.Cleanup(func() { mappingStore = origStore })
+	for record, owner := range map[string]string{reconcileTestRecordA: "cu:m1", reconcileTestRecordB: "cu:m2"} {
+		if _, err := store.Put(t.Context(), "committee_member.sfid."+record, []byte(owner)); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	reconcileFetchCommitteeMemberFn = func(context.Context, string, string) (*committeeservice.CommitteeMemberFullWithReadonlyAttributes, string, error) {
 		return &committeeservice.CommitteeMemberFullWithReadonlyAttributes{}, "etag", nil
@@ -398,6 +434,71 @@ func TestReconcileCommitteeMemberVotingItemTimeout(t *testing.T) {
 	}
 	if res.errored != 1 || res.patched != 1 {
 		t.Errorf("counters = %+v; want errored=1 patched=1", res)
+	}
+}
+
+// TestReconcileCommitteeMemberVotingForeignOwnerNotPatched verifies that a
+// member whose v1 record's forward mapping belongs to another v2 member is
+// never PATCHed, whether the conflict is found by the mapping backfill or by
+// the pre-PATCH ownership check. Otherwise a member with no voting status
+// would overwrite the owner's "Voting Rep" with "Observer".
+func TestReconcileCommitteeMemberVotingForeignOwnerNotPatched(t *testing.T) {
+	reconcileTestLogger(t)
+	origFetch, origGet, origUpdate := reconcileFetchCommitteeMemberFn, reconcileGetV1ObjectFn, reconcileUpdateV1MemberFn
+	t.Cleanup(func() {
+		reconcileFetchCommitteeMemberFn, reconcileGetV1ObjectFn, reconcileUpdateV1MemberFn = origFetch, origGet, origUpdate
+	})
+	reconcileFetchCommitteeMemberFn = func(context.Context, string, string) (*committeeservice.CommitteeMemberFullWithReadonlyAttributes, string, error) {
+		return &committeeservice.CommitteeMemberFullWithReadonlyAttributes{}, "etag", nil
+	}
+	reconcileGetV1ObjectFn = func(context.Context, string) (map[string]any, bool, error) {
+		return map[string]any{"voting_status__c": "Voting Rep"}, true, nil
+	}
+	reconcileUpdateV1MemberFn = func(_ context.Context, _, _, memberSFID string, payload projectServiceCommitteeMemberUpdate) error {
+		t.Errorf("PATCHed %s to %q; a foreign-owned v1 record must never be PATCHed", memberSFID, payload.VotingStatus)
+		return nil
+	}
+
+	reverseValue := reconcileTestProject + ":" + reconcileTestCommittee + ":" + reconcileTestContactA
+	base := votingReconcileItem{
+		memberUID: "m1", committeeUID: "cu", reverseMapping: reverseValue, projectSFID: reconcileTestProject,
+		committeeSFID: reconcileTestCommittee, contactSFID: reconcileTestContactA, recordSFID: reconcileTestRecordA,
+		v1Status: "Voting Rep", target: v1NoVotingStatus, mismatch: true,
+	}
+	tests := []struct {
+		name           string
+		needsCompanion bool
+		needsForward   bool
+	}{
+		{name: "conflict found by backfill", needsCompanion: true, needsForward: true},
+		{name: "existing companion skips backfill", needsCompanion: false, needsForward: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newFakeMappingStore()
+			orig := mappingStore
+			mappingStore = store
+			t.Cleanup(func() { mappingStore = orig })
+			ctx := t.Context()
+			for key, value := range map[string]string{
+				"committee_member.uid.m1":                       reverseValue,
+				"committee_member.sfid." + reconcileTestRecordA: "cu:other",
+			} {
+				if _, err := store.Put(ctx, key, []byte(value)); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			item := base
+			item.needsCompanion, item.needsForward = tt.needsCompanion, tt.needsForward
+			res := reconcileCommitteeMemberVotingResult{}
+			if err := applyVotingReconcileItems(ctx, []votingReconcileItem{item}, rate.NewLimiter(rate.Inf, 1), "committee_member.sfid.", "platform-community__c.", &res); err != nil {
+				t.Fatalf("applyVotingReconcileItems: %v", err)
+			}
+			if res.patched != 0 || res.mappingConflicts != 1 || res.errored != 0 {
+				t.Errorf("counters = %+v; want patched=0 mapping_conflicts=1 errored=0", res)
+			}
+		})
 	}
 }
 

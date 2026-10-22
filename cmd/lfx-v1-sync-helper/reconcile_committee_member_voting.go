@@ -415,21 +415,44 @@ func applyVotingReconcileItems(ctx context.Context, items []votingReconcileItem,
 			}
 		}
 		itemCtx, cancel := context.WithTimeout(ctx, reconcileMemberTimeout)
+		// A member that cannot claim the forward key must not PATCH the v1
+		// record: it may belong to another v2 member.
+		owned := true
 		if item.needsCompanion || item.needsForward {
-			backfillReconcileMappings(itemCtx, item, forwardMappingKeyPrefix, res)
+			owned = backfillReconcileMappings(itemCtx, item, forwardMappingKeyPrefix, res)
 		}
-		if item.mismatch {
-			applyVotingReconcilePatch(itemCtx, item, v1ObjectKeyPrefix, res)
+		if item.mismatch && owned {
+			applyVotingReconcilePatch(itemCtx, item, forwardMappingKeyPrefix, v1ObjectKeyPrefix, res)
 		}
 		cancel()
 	}
 	return nil
 }
 
-// applyVotingReconcilePatch re-reads the live v2 member and v1 record, then
-// PATCHes v1 to the v2 value if the two still disagree.
-func applyVotingReconcilePatch(ctx context.Context, item votingReconcileItem, v1ObjectKeyPrefix string, res *reconcileCommitteeMemberVotingResult) {
+// applyVotingReconcilePatch checks that item's member owns the v1 record's
+// forward mapping, re-reads the live v2 member and v1 record, then PATCHes v1
+// to the v2 value if the two still disagree.
+func applyVotingReconcilePatch(ctx context.Context, item votingReconcileItem, forwardMappingKeyPrefix, v1ObjectKeyPrefix string, res *reconcileCommitteeMemberVotingResult) {
 	log := logger.With("member_uid", item.memberUID, "committee_uid", item.committeeUID, "record_sfid", item.recordSFID)
+
+	// The record-keyed forward mapping names the v2 member that owns the v1
+	// record. Another member's status must not overwrite the owner's.
+	forwardKey := forwardMappingKeyPrefix + item.recordSFID
+	forward, err := mappingStore.Get(ctx, forwardKey)
+	switch {
+	case errors.Is(err, ErrKeyNotFound):
+		log.InfoContext(ctx, "reconcile: no forward mapping for v1 record, not patching")
+		res.noMapping++
+		return
+	case err != nil:
+		log.With(errKey, err, "key", forwardKey).WarnContext(ctx, "reconcile: failed to read forward mapping, not patching")
+		res.errored++
+		return
+	case string(forward.Value) != item.committeeUID+":"+item.memberUID:
+		log.WarnContext(ctx, "reconcile: v1 record's forward mapping belongs to another member or is tombstoned, not patching")
+		res.mappingConflicts++
+		return
+	}
 
 	member, _, err := reconcileFetchCommitteeMemberFn(ctx, item.committeeUID, item.memberUID)
 	if err != nil {
@@ -483,7 +506,10 @@ func applyVotingReconcilePatch(ctx context.Context, item votingReconcileItem, v1
 // member would make a later v2 delete of this member
 // (syncCommitteeMemberDeleteToV1) tombstone that member's forward mapping. A
 // failed companion write leaves the companion missing, so a rerun retries it.
-func backfillReconcileMappings(ctx context.Context, item votingReconcileItem, forwardMappingKeyPrefix string, res *reconcileCommitteeMemberVotingResult) {
+//
+// Returns true when item's member owns the forward key afterwards, i.e. a
+// voting PATCH for it may proceed.
+func backfillReconcileMappings(ctx context.Context, item votingReconcileItem, forwardMappingKeyPrefix string, res *reconcileCommitteeMemberVotingResult) bool {
 	reverseKey := "committee_member.uid." + item.memberUID
 	entry, err := mappingStore.Get(ctx, reverseKey)
 	switch {
@@ -491,20 +517,21 @@ func backfillReconcileMappings(ctx context.Context, item votingReconcileItem, fo
 		logger.With("member_uid", item.memberUID).
 			InfoContext(ctx, "reconcile: reverse mapping removed or changed since the scan, not writing mappings")
 		res.noMapping++
-		return
+		return false
 	case err != nil:
 		logger.With(errKey, err, "key", reverseKey).WarnContext(ctx, "reconcile: failed to re-read reverse mapping")
 		res.errored++
-		return
+		return false
 	}
 
 	forwardKey := forwardMappingKeyPrefix + item.recordSFID
 	if !createReconcileMapping(ctx, forwardKey, item.committeeUID+":"+item.memberUID, res) {
-		return
+		return false
 	}
 	if item.needsCompanion {
 		createReconcileMapping(ctx, committeeMemberRecordSFIDKey(item.memberUID), item.recordSFID, res)
 	}
+	return true
 }
 
 // createReconcileMapping creates a mapping key only if it is absent. An
