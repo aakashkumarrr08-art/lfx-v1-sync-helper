@@ -110,23 +110,7 @@ spec:
             # --- required by LoadConfig() but not used by this job ---
             - name: PROJECT_SERVICE_URL
               value: "http://lfx-v2-project-service.project-service.svc.cluster.local:8080"
-            - name: V1_DB_HOST
-              valueFrom:
-                secretKeyRef:
-                  key: host
-                  name: postgres-credentials-ad-hoc
-            - name: V1_DB_USER
-              valueFrom:
-                secretKeyRef:
-                  key: username
-                  name: postgres-credentials-ad-hoc
-            - name: V1_DB_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  key: password
-                  name: postgres-credentials-ad-hoc
-            - name: V1_DB_NAME
-              value: "sfdc"
+            # No V1_DB_*: this job skips the v1 platform database client.
             # Optional: raise if logs show scan-timeout warnings. Defaults to 2m.
             # - name: NATS_FETCH_MAX_WAIT
             #   value: "2m"

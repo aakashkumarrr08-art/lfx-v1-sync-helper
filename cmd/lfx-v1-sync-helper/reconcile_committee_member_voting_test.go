@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"reflect"
 	"sort"
 	"testing"
 	"time"
@@ -156,6 +157,65 @@ func TestReconcileCommitteeMemberVotingJoin(t *testing.T) {
 	}
 	if m9.memberUID != "m9" || m9.mismatch || m9.needsCompanion || !m9.needsForward || m9.recordSFID != reconcileTestRecordD {
 		t.Errorf("m9 = %+v", m9)
+	}
+}
+
+func TestReconcileCommitteeMemberVotingJoinCompanionMismatch(t *testing.T) {
+	reconcileTestLogger(t)
+	objects := map[string][]byte{
+		reconcileTestRecordA: []byte(`{"collaboration_name__c":"` + reconcileTestCommittee + `","contact_name__c":"` + reconcileTestContactA + `","voting_status__c":"Voting Rep"}`),
+	}
+	res := reconcileCommitteeMemberVotingResult{}
+	idx := buildV1MemberVotingIndex(t.Context(), objects, &res)
+	member := map[string][]byte{"m1": []byte(`{"uid":"m1","committee_uid":"cu","voting":{"status":""}}`)}
+	reverse := map[string]string{"m1": reconcileTestProject + ":" + reconcileTestCommittee + ":" + reconcileTestContactA}
+	// The companion names record B, but the join resolves record A.
+	companions := map[string]string{"m1": reconcileTestRecordB}
+	forwards := map[string]string{reconcileTestRecordB: "cu:m1"}
+
+	items := joinVotingReconcile(t.Context(), member, reverse, companions, forwards, idx, &res)
+	if len(items) != 0 {
+		t.Errorf("items = %+v, want none: a mismatched companion must not be repaired or PATCHed", items)
+	}
+	want := reconcileCommitteeMemberVotingResult{inspected: 1, companionMismatch: 1}
+	if res != want {
+		t.Errorf("counters = %+v\nwant %+v", res, want)
+	}
+}
+
+func TestReconcileCommitteeMemberVotingResultLogFields(t *testing.T) {
+	res := reconcileCommitteeMemberVotingResult{
+		dryRun: true, inspected: 1, noMapping: 2, poisonedMapping: 3, noV1Record: 4, ambiguousV1Record: 5,
+		companionMismatch: 6, v1ObjectsUndecodable: 7, matched: 8, mismatched: 9, patched: 10, skippedNowEqual: 11,
+		mappingsMissing: 12, mappingsBackfilled: 13, mappingConflicts: 14, errored: 15,
+	}
+	fields := res.logFields()
+	if len(fields)%2 != 0 {
+		t.Fatalf("logFields() returned an odd-length slice: %d", len(fields))
+	}
+	got := make(map[string]any, len(fields)/2)
+	for i := 0; i < len(fields); i += 2 {
+		key, ok := fields[i].(string)
+		if !ok {
+			t.Fatalf("logFields()[%d] = %v, want a string key", i, fields[i])
+		}
+		got[key] = fields[i+1]
+	}
+	// Every result field must be logged, so a new counter cannot be added
+	// without a logFields() entry.
+	if n := reflect.TypeOf(res).NumField(); len(got) != n {
+		t.Errorf("logFields() has %d keys, result struct has %d fields", len(got), n)
+	}
+	want := map[string]any{
+		"dry_run": true, "inspected": 1, "no_mapping": 2, "poisoned_mapping": 3, "no_v1_record": 4,
+		"ambiguous_v1_record": 5, "companion_mismatch": 6, "v1_objects_undecodable": 7, "matched": 8,
+		"mismatched": 9, "patched": 10, "skipped_now_equal": 11, "mappings_missing": 12,
+		"mappings_backfilled": 13, "mapping_conflicts": 14, "errored": 15,
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("logFields()[%q] = %v, want %v", k, got[k], v)
+		}
 	}
 }
 

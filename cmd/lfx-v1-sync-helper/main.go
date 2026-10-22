@@ -142,7 +142,12 @@ func main() {
 	// --backfill-committee-member-mappings, --backfill-v1-mappings-to-postgres,
 	// --backfill-projects, and --backfill-committees only need NATS KV (plus
 	// Postgres for the v1-mappings backfill); skip full config and API client init.
-	// --backfill-acs-project and --backfill-acs-org require full config and API client init.
+	// Every other mode, including --backfill-acs-project, --backfill-acs-org,
+	// --backfill-committee-member-names and --reconcile-committee-member-voting,
+	// needs full config and the JWT, Goa and v1 API clients.
+	// --reconcile-committee-member-voting never reads the v1 platform database
+	// or calls the Auth0 Management API, so it skips those two clients and the
+	// Job pod does not need their credentials.
 	var err error
 	if *doBackfillCommitteeMemberMappings || *doBackfillV1MappingsToPG || *doBackfillProjects || *doBackfillCommittees {
 		cfg = LoadMinimalConfig()
@@ -152,9 +157,11 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error loading configuration: %v\n", err)
 			os.Exit(1)
 		}
-		if err := initV1DB(context.Background(), cfg); err != nil {
-			logger.With(errKey, err).Error("error initializing v1 platform database connection")
-			os.Exit(1)
+		if !*doReconcileCommitteeMemberVoting {
+			if err := initV1DB(context.Background(), cfg); err != nil {
+				logger.With(errKey, err).Error("error initializing v1 platform database connection")
+				os.Exit(1)
+			}
 		}
 		if err := initJWTClient(cfg); err != nil {
 			logger.With(errKey, err).Error("error initializing JWT client")
@@ -168,9 +175,11 @@ func main() {
 			logger.With(errKey, err).Error("error initializing v1 client")
 			os.Exit(1)
 		}
-		if err := initAuth0MgmtClient(cfg); err != nil {
-			logger.With(errKey, err).Error("error initializing Auth0 Management API client")
-			os.Exit(1)
+		if !*doReconcileCommitteeMemberVoting {
+			if err := initAuth0MgmtClient(cfg); err != nil {
+				logger.With(errKey, err).Error("error initializing Auth0 Management API client")
+				os.Exit(1)
+			}
 		}
 	}
 

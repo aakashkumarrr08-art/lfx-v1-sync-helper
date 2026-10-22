@@ -25,10 +25,11 @@ type reconcileCommitteeMemberVotingOpts struct {
 type reconcileCommitteeMemberVotingResult struct {
 	dryRun               bool
 	inspected            int // v2 committee members read from KV_committee-members
-	noMapping            int // no live reverse mapping (never synced to v1, or deleted)
+	noMapping            int // no live reverse mapping at join time; reverse mapping removed or changed before the live backfill; or no record-keyed forward mapping at PATCH time
 	poisonedMapping      int // reverse mapping malformed, or no contact SFID resolvable for it
 	noV1Record           int // no live platform-community__c record for the member
 	ambiguousV1Record    int // more than one live v1 record for the same committee + contact
+	companionMismatch    int // record-sfid companion names a different v1 record than the join; needs manual repair
 	v1ObjectsUndecodable int // platform-community__c values that could not be decoded
 	matched              int // voting status already in sync
 	mismatched           int // voting status differs between v2 and v1
@@ -51,6 +52,7 @@ func (res reconcileCommitteeMemberVotingResult) logFields() []any {
 		"poisoned_mapping", res.poisonedMapping,
 		"no_v1_record", res.noV1Record,
 		"ambiguous_v1_record", res.ambiguousV1Record,
+		"companion_mismatch", res.companionMismatch,
 		"v1_objects_undecodable", res.v1ObjectsUndecodable,
 		"matched", res.matched,
 		"mismatched", res.mismatched,
@@ -256,23 +258,34 @@ func joinVotingReconcile(
 		if rec.Voting != nil {
 			item.v2Status = rec.Voting.Status
 		}
-		item.mismatch, item.target = classifyVotingReconcile(item.v2Status, item.v1Status)
-		if item.mismatch {
-			res.mismatched++
-		} else {
-			res.matched++
-		}
 
 		// A companion without its forward key is a partial write (companion
 		// written, forward write failed); repair the forward key alone. A
 		// tombstoned forward key was deleted on purpose and is left alone.
 		companion, hasCompanion := companions[rec.UID]
-		if !hasCompanion || isTombstonedMapping([]byte(companion)) {
+		switch {
+		case !hasCompanion || isTombstonedMapping([]byte(companion)):
 			item.needsCompanion = true
 			item.needsForward = true
-		} else if companion == item.recordSFID {
+		case companion != item.recordSFID:
+			// The companion names another record (e.g. the v1 row was
+			// recreated). Claiming the joined record's forward key would split
+			// the companion from the forward key, and a later v2 delete would
+			// tombstone the wrong one, so this needs a manual repair.
+			logger.With("member_uid", rec.UID, "companion_record_sfid", companion, "record_sfid", item.recordSFID).
+				WarnContext(ctx, "reconcile: record-sfid companion names a different v1 record, skipping")
+			res.companionMismatch++
+			continue
+		default:
 			_, hasForward := forwards[item.recordSFID]
 			item.needsForward = !hasForward
+		}
+
+		item.mismatch, item.target = classifyVotingReconcile(item.v2Status, item.v1Status)
+		if item.mismatch {
+			res.mismatched++
+		} else {
+			res.matched++
 		}
 		if item.needsCompanion || item.needsForward {
 			res.mappingsMissing++
