@@ -127,7 +127,7 @@ func TestCommitteeUpdateClearsFromSerializedSnapshot(t *testing.T) {
 	}{
 		{"omitted cleared fields", base, map[string]any{
 			"Name": "Committee", "Category": "Other", "Description": "", "CommitteeWebsite": "",
-			"MailingList": "", "ChatChannel": "", "JoinMode": "",
+			"MailingList": "", "ChatChannel": "", "JoinMode": "", "PublicEnabled": false,
 		}},
 		{"populated mailing list", func() committeeSnapshot {
 			value := base
@@ -136,7 +136,7 @@ func TestCommitteeUpdateClearsFromSerializedSnapshot(t *testing.T) {
 			return value
 		}(), map[string]any{
 			"Name": "Committee", "Category": "Other", "Description": "", "CommitteeWebsite": "",
-			"MailingList": "list@example.invalid", "ChatChannel": "", "JoinMode": "",
+			"MailingList": "list@example.invalid", "ChatChannel": "", "JoinMode": "", "PublicEnabled": false,
 		}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -154,7 +154,7 @@ func TestCommitteeUpdateClearsFromSerializedSnapshot(t *testing.T) {
 				t.Fatal("empty description should be omitted by committee-service serialization")
 			}
 			assertUpdateJSON(t, mapV2DataToV1CommitteeUpdatePayload(event.Data), tt.want)
-			for _, missing := range []string{"updated_at", "sso_group_enabled", "total_members", "total_voting_repos", "has_mailing_list"} {
+			for _, missing := range []string{"updated_at", "sso_group_enabled", "total_members", "total_voting_repos", "has_mailing_list", "public"} {
 				trimmed := make(map[string]any, len(event.Data))
 				for key, value := range event.Data {
 					if key != missing {
@@ -163,6 +163,9 @@ func TestCommitteeUpdateClearsFromSerializedSnapshot(t *testing.T) {
 				}
 				// A near-complete but truncated event must not clear absent fields.
 				want := map[string]any{"Name": "Committee", "Category": "Other"}
+				if missing != "public" {
+					want["PublicEnabled"] = false
+				}
 				if list, ok := trimmed["mailing_list"].(string); ok {
 					want["MailingList"] = list
 				}
@@ -523,6 +526,97 @@ func TestMapV2DataToV1ProjectUpdatePayload_IsFoundationSwitchesProjectType(t *te
 			}
 			if !reflect.DeepEqual(got.ProjectType, tt.wantProject) {
 				t.Fatalf("ProjectType = %v, want %v", got.ProjectType, tt.wantProject)
+			}
+		})
+	}
+}
+
+func TestV2CommitteePublicWrittenToV1Create(t *testing.T) {
+	tests := []struct {
+		name     string
+		data     map[string]any
+		wantPub  any
+		wantName any
+	}{
+		{
+			name:     "public with display name",
+			data:     map[string]any{"name": "Committee", "category": "Other", "public": true, "display_name": "Public Committee"},
+			wantPub:  true,
+			wantName: "Public Committee",
+		},
+		{
+			name:    "private",
+			data:    map[string]any{"name": "Committee", "category": "Other", "public": false},
+			wantPub: false,
+		},
+		{
+			name: "legacy event without public",
+			data: map[string]any{"name": "Committee", "category": "Other"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := setupSyncTest(t, 201, `{"ID":"committee-sfid"}`)
+			if err := syncCommitteeCreateToV1(t.Context(), "committee-uid", "project-a", tt.data); err != nil {
+				t.Fatal(err)
+			}
+			requests := h.recordedRequests()
+			if len(requests) != 1 {
+				t.Fatalf("v1 create requests = %+v", requests)
+			}
+			if got := requests[0].Body["PublicEnabled"]; got != tt.wantPub {
+				t.Errorf("PublicEnabled = %v, want %v", got, tt.wantPub)
+			}
+			if got := requests[0].Body["PublicName"]; got != tt.wantName {
+				t.Errorf("PublicName = %v, want %v", got, tt.wantName)
+			}
+		})
+	}
+}
+
+func TestV2CommitteePublicWrittenToV1Update(t *testing.T) {
+	tests := []struct {
+		name     string
+		data     map[string]any
+		wantPub  any
+		wantName any
+	}{
+		{
+			name:     "enable public",
+			data:     map[string]any{"name": "Committee", "public": true, "display_name": "Public Committee"},
+			wantPub:  true,
+			wantName: "Public Committee",
+		},
+		{
+			name:    "disable public",
+			data:    map[string]any{"name": "Committee", "public": false},
+			wantPub: false,
+		},
+		{
+			name: "partial event leaves visibility untouched",
+			data: map[string]any{"name": "Committee"},
+		},
+		{
+			name:    "empty display name is never sent",
+			data:    map[string]any{"name": "Committee", "public": true, "display_name": ""},
+			wantPub: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := setupSyncTest(t, 200, `{}`)
+			if err := syncCommitteeUpdateToV1(t.Context(), "committee-uid", "project-a", "committee-sfid", tt.data); err != nil {
+				t.Fatal(err)
+			}
+			requests := h.recordedRequests()
+			if len(requests) != 1 {
+				t.Fatalf("v1 update requests = %+v", requests)
+			}
+			if got := requests[0].Body["PublicEnabled"]; got != tt.wantPub {
+				t.Errorf("PublicEnabled = %v, want %v", got, tt.wantPub)
+			}
+			if got := requests[0].Body["PublicName"]; got != tt.wantName {
+				t.Errorf("PublicName = %v, want %v", got, tt.wantName)
 			}
 		})
 	}

@@ -163,6 +163,12 @@ Boot ordering (`main.go`): NATS + KV bucket handles → a KV-backed `mappingStor
   - The v1 PATCH/DELETE member endpoints take the contact SFID (`MemberID`) as the path id, not `ID`.
   - Members created before this change are repaired by `--reconcile-committee-member-voting`.
 
+#### Committee public visibility — lfx-self-serve-ops#945
+
+- **v2 → v1** (`syncCommitteeCreateToV1` / `mapV2DataToV1CommitteeUpdatePayload`): v2 `public` is sent as `PublicEnabled` and v2 `display_name` as `PublicName`. v1 project-service defaults `public_enabled` to `false` when it is omitted, so a v2-created public committee was previously stored as private in v1.
+  - On update, `PublicEnabled` is sent only when the event carries `public`, so a partial or legacy event cannot flip visibility. `PublicName` is sent only when non-empty, because v1 PATCH treats an empty name as unchanged and cannot clear it. v1 clears `public_name` itself when `PublicEnabled` is `false`, and fills it with the committee name when `PublicEnabled` is `true` and no name is sent.
+  - This only affects future writes. Committees already out of sync need a separate, per-record repair that decides the source of truth from the last deliberate edit, not from timestamps (the sync client rewrites `lastmodifieddate` on both sides).
+
 ### Python ETL (Meltano)
 
 #### Configuration Structure
