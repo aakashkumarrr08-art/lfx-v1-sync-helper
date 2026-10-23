@@ -1097,14 +1097,16 @@ func mapV1DataToCommitteeMemberCreatePayload(ctx context.Context, committeeUID s
 		payload.Status = "Active" // Default status.
 	}
 
-	// Map voting information - only if voting_status__c is set.
-	if votingStatus, ok := v1Data["voting_status__c"].(string); ok && votingStatus != "" {
+	// Map voting information - only if voting_status__c is set. v1 "None" means
+	// no voting status, the same as empty (v2 rejects "None" on voting-enabled
+	// committees).
+	if votingStatus, ok := v1Data["voting_status__c"].(string); ok && normalizeVotingStatus(votingStatus) != "" {
 		votingStruct := &struct {
 			Status    string  `json:"status"`
 			StartDate *string `json:"start_date,omitempty"`
 			EndDate   *string `json:"end_date,omitempty"`
 		}{
-			Status: votingStatus,
+			Status: normalizeVotingStatus(votingStatus),
 		}
 
 		if votingStartDate, ok := v1Data["voting_start_date__c"].(string); ok && votingStartDate != "" {
@@ -1282,14 +1284,16 @@ func mapV1DataToCommitteeMemberUpdatePayload(ctx context.Context, committeeUID s
 		payload.Status = "Active" // Default status.
 	}
 
-	// Map voting information - only if voting_status__c is set.
-	if votingStatus, ok := v1Data["voting_status__c"].(string); ok && votingStatus != "" {
+	// Map voting information - only if voting_status__c is set. v1 "None" means
+	// no voting status, the same as empty (v2 rejects "None" on voting-enabled
+	// committees).
+	if votingStatus, ok := v1Data["voting_status__c"].(string); ok && normalizeVotingStatus(votingStatus) != "" {
 		votingStruct := &struct {
 			Status    string  `json:"status"`
 			StartDate *string `json:"start_date,omitempty"`
 			EndDate   *string `json:"end_date,omitempty"`
 		}{
-			Status: votingStatus,
+			Status: normalizeVotingStatus(votingStatus),
 		}
 
 		if votingStartDate, ok := v1Data["voting_start_date__c"].(string); ok && votingStartDate != "" {

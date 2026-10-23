@@ -1,0 +1,127 @@
+# Copyright The Linux Foundation and each contributor to LFX.
+# SPDX-License-Identifier: MIT
+#
+# One-shot Job to reconcile committee member voting status between V2 (Self
+# Serve) and v1 (lfx-self-serve#4079). V2 wins: the Self Serve roster is what
+# admins see, so v1 is PATCHed to the V2 value.
+#
+# A V2 member with no voting status is written to v1 as "Observer" — v1 rejects
+# "None" on POST/PATCH and cannot clear the field, and "Observer" is the only
+# non-voting value it accepts. V2 empty and v1 ""/"None"/"Observer" are treated
+# as in sync.
+#
+# The job scans KV_committee-members, the committee_member.uid.* and
+# committee_member.record_sfid.* v1-mappings, and the platform-community__c
+# v1-objects records, joins each V2 member to its live v1 record, and:
+#   - reports (dry run) or PATCHes (live run) every voting-status mismatch,
+#     re-reading the live V2 member and v1 record first and skipping the write
+#     if they already agree (skipped_now_equal);
+#   - on a live run, writes the record-sfid companion and record-keyed forward
+#     mapping for members created in Self Serve before #4079, so later v1 edits
+#     reach V2. Existing mapping keys are never overwritten (mapping_conflicts).
+#
+# Idempotent: a second dry run after a live run should report mismatched=0.
+#
+# One-shot: applied manually via kubectl — NOT managed by ArgoCD.
+# Run --backfill-committee-member-mappings first so legacy reverse mappings
+# carry the contact SFID the v1 PATCH path needs.
+#
+# Dry run (default): "--dry-run" is already in args — apply as-is to do a dry run.
+# Live run: remove "--dry-run" from args before applying. PATCHes are paced by
+# --emit-rate (default 2/s).
+#
+# Deploy with:
+#   # If the Job already exists (e.g. from a prior dry run), delete it first —
+#   # a completed Job's pod template is immutable and re-applying will fail:
+#   kubectl --context lfx-v2-prod -n v1-sync-helper delete job reconcile-committee-member-voting --ignore-not-found
+#   kubectl --context lfx-v2-prod -n v1-sync-helper apply -f manifests/reconcile-committee-member-voting-job.yaml
+#
+# Monitor:
+#   kubectl --context lfx-v2-prod -n v1-sync-helper logs -f --timestamps=true job/reconcile-committee-member-voting
+#
+# Abort:
+#   kubectl --context lfx-v2-prod -n v1-sync-helper delete job reconcile-committee-member-voting
+#
+# Auto-cleans after 1h via ttlSecondsAfterFinished.
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: reconcile-committee-member-voting
+  namespace: v1-sync-helper
+  labels:
+    app.kubernetes.io/name: lfx-v1-sync-helper
+    app.kubernetes.io/component: backfill
+spec:
+  ttlSecondsAfterFinished: 3600
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: lfx-v1-sync-helper
+        app.kubernetes.io/component: backfill
+    spec:
+      restartPolicy: Never
+      serviceAccountName: v1-sync-helper-sa
+      containers:
+        - name: backfill
+          # XXX: Replace with the image SHA for the release you want to run against.
+          # Find the current prod image with:
+          #   kubectl --context lfx-v2-prod -n v1-sync-helper get deployment \
+          #     -o jsonpath='{.items[0].spec.template.spec.containers[0].image}'
+          image: ghcr.io/linuxfoundation/lfx-v1-sync-helper/lfx-v1-sync-helper:0.15.0
+          imagePullPolicy: IfNotPresent
+          args: ["--reconcile-committee-member-voting", "--dry-run"]
+          env:
+            # --- actually used by this job ---
+            - name: NATS_URL
+              value: "nats://lfx-platform-nats.lfx.svc.cluster.local:4222"
+            - name: COMMITTEE_SERVICE_URL
+              value: "http://lfx-v2-committee-service.committee-service.svc.cluster.local:8080"
+            - name: HEIMDALL_JWKS_URL
+              value: "http://lfx-platform-heimdall.lfx.svc.cluster.local:4457/.well-known/jwks"
+            - name: HEIMDALL_KEY_ID
+              value: "prod-rsa-2025-12-12-001"
+            - name: HEIMDALL_CLIENT_ID
+              value: "N36DA2hiUeMHN4XuaSggrJH3ELA2Ss31"
+            - name: USE_MSGPACK
+              value: "1"
+            - name: HEIMDALL_PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: key.pem
+                  name: heimdall-signer-cert-ad-hoc
+            # v1 project-service PATCHes. LFX_API_GW defaults to the DEV gateway
+            # when unset, so it must be set explicitly here.
+            - name: LFX_API_GW
+              value: "https://api-gw.platform.linuxfoundation.org/"
+            - name: AUTH0_TENANT
+              value: "linuxfoundation"
+            - name: AUTH0_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  key: client_id
+                  name: v1-sync-helper-secrets
+            - name: AUTH0_PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: client_private_key
+                  name: v1-sync-helper-secrets
+            # --- required by LoadConfig() but not used by this job ---
+            - name: PROJECT_SERVICE_URL
+              value: "http://lfx-v2-project-service.project-service.svc.cluster.local:8080"
+            # No V1_DB_*: this job skips the v1 platform database client.
+            # Optional: raise if logs show scan-timeout warnings. Defaults to 2m.
+            # - name: NATS_FETCH_MAX_WAIT
+            #   value: "2m"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "10m"
+            limits:
+              # Holds every committee member, committee-member mapping and
+              # platform-community__c record in memory for the join.
+              memory: "2Gi"
+              cpu: "200m"
+          securityContext:
+            allowPrivilegeEscalation: false
