@@ -375,6 +375,13 @@ func syncCommitteeCreateToV1(ctx context.Context, committeeUID, projectSFID stri
 	if ssoGroupName, ok := data["sso_group_name"].(string); ok && ssoGroupName != "" {
 		payload.SSOGroupName = ssoGroupName
 	}
+	// v1 defaults PublicEnabled to false when omitted, so v2 visibility must be sent explicitly.
+	if public, ok := data["public"].(bool); ok {
+		payload.PublicEnabled = &public
+	}
+	if displayName, ok := data["display_name"].(string); ok {
+		payload.PublicName = displayName
+	}
 
 	log.With("payload_category", payload.Category).InfoContext(ctx, "creating committee in v1")
 
@@ -527,6 +534,15 @@ func mapV2DataToV1CommitteeUpdatePayload(data map[string]any) projectServiceComm
 	if ssoGroupName, ok := data["sso_group_name"].(string); ok && ssoGroupName != "" {
 		// Generated v2 identifier, not user-clearable. Never write back an empty name.
 		payload.SSOGroupName = &ssoGroupName
+	}
+	// v1 only changes PublicEnabled when it is present and clears public_name when it is false,
+	// so send it only when the event carries it; a legacy partial body must not flip visibility.
+	if public, ok := data["public"].(bool); ok {
+		payload.PublicEnabled = &public
+	}
+	if displayName, ok := data["display_name"].(string); ok && displayName != "" {
+		// v1 cannot clear public_name through PATCH (empty means unchanged), so never send an empty name.
+		payload.PublicName = &displayName
 	}
 	return payload
 }

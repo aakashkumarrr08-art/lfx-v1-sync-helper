@@ -127,7 +127,7 @@ func TestCommitteeUpdateClearsFromSerializedSnapshot(t *testing.T) {
 	}{
 		{"omitted cleared fields", base, map[string]any{
 			"Name": "Committee", "Category": "Other", "Description": "", "CommitteeWebsite": "",
-			"MailingList": "", "ChatChannel": "", "JoinMode": "",
+			"MailingList": "", "ChatChannel": "", "JoinMode": "", "PublicEnabled": false,
 		}},
 		{"populated mailing list", func() committeeSnapshot {
 			value := base
@@ -136,7 +136,7 @@ func TestCommitteeUpdateClearsFromSerializedSnapshot(t *testing.T) {
 			return value
 		}(), map[string]any{
 			"Name": "Committee", "Category": "Other", "Description": "", "CommitteeWebsite": "",
-			"MailingList": "list@example.invalid", "ChatChannel": "", "JoinMode": "",
+			"MailingList": "list@example.invalid", "ChatChannel": "", "JoinMode": "", "PublicEnabled": false,
 		}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -154,7 +154,7 @@ func TestCommitteeUpdateClearsFromSerializedSnapshot(t *testing.T) {
 				t.Fatal("empty description should be omitted by committee-service serialization")
 			}
 			assertUpdateJSON(t, mapV2DataToV1CommitteeUpdatePayload(event.Data), tt.want)
-			for _, missing := range []string{"updated_at", "sso_group_enabled", "total_members", "total_voting_repos", "has_mailing_list"} {
+			for _, missing := range []string{"updated_at", "sso_group_enabled", "total_members", "total_voting_repos", "has_mailing_list", "public"} {
 				trimmed := make(map[string]any, len(event.Data))
 				for key, value := range event.Data {
 					if key != missing {
@@ -163,6 +163,9 @@ func TestCommitteeUpdateClearsFromSerializedSnapshot(t *testing.T) {
 				}
 				// A near-complete but truncated event must not clear absent fields.
 				want := map[string]any{"Name": "Committee", "Category": "Other"}
+				if missing != "public" {
+					want["PublicEnabled"] = false
+				}
 				if list, ok := trimmed["mailing_list"].(string); ok {
 					want["MailingList"] = list
 				}
