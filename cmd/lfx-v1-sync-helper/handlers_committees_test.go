@@ -53,6 +53,10 @@ func TestCommitteeBasesEqual_BooleanOnlyDifferenceTriggersUpdate(t *testing.T) {
 			name: "DisplayName differs",
 			mut:  func(b *committeeservice.CommitteeBaseWithReadonlyAttributes) { b.DisplayName = sptr("New Display") },
 		},
+		{
+			name: "ParentUID differs",
+			mut:  func(b *committeeservice.CommitteeBaseWithReadonlyAttributes) { b.ParentUID = sptr("parent-uid") },
+		},
 	}
 
 	baseTemplate := func() *committeeservice.CommitteeBaseWithReadonlyAttributes {
@@ -87,7 +91,7 @@ func TestCommitteeBasesEqual_BooleanOnlyDifferenceTriggersUpdate(t *testing.T) {
 
 // TestCommitteeBasesEqual_IgnoresNonSyncedFields verifies that
 // committeeBasesEqual does not report a difference for fields the sync does not
-// manage (RequiresReview, ParentUID, JoinMode, Repository, Scope, Deliverables,
+// manage (RequiresReview, JoinMode, Repository, Scope, Deliverables,
 // KeyDates, Calendar). Admin edits made directly in V2 to these fields must not
 // force redundant sync updates.
 func TestCommitteeBasesEqual_IgnoresNonSyncedFields(t *testing.T) {
@@ -104,7 +108,6 @@ func TestCommitteeBasesEqual_IgnoresNonSyncedFields(t *testing.T) {
 		ProjectUID:     sptr("proj-uid"),
 		Category:       sptr("Governance"),
 		RequiresReview: true,                        // differs
-		ParentUID:      sptr("parent-uid"),          // differs
 		JoinMode:       "closed",                    // differs
 		Repository:     sptr("https://git.example"), // differs
 	}
@@ -129,6 +132,7 @@ func TestSeedCommitteeUpdateFromCurrentBase_PreservesCurrentValues(t *testing.T)
 		EnableVoting:    true,
 		SsoGroupEnabled: true,
 		Public:          true,
+		ParentUID:       sptr("parent-uid"),
 	}
 	payload := &committeeservice.UpdateCommitteeBasePayload{
 		UID:        sptr("cmt-uid"),
@@ -163,6 +167,9 @@ func TestSeedCommitteeUpdateFromCurrentBase_PreservesCurrentValues(t *testing.T)
 	}
 	if !payload.Public {
 		t.Error("Public not seeded from currentBase; absent V1 key would clobber current true with zero-value false")
+	}
+	if payload.ParentUID == nil || *payload.ParentUID != "parent-uid" {
+		t.Errorf("ParentUID not preserved from current base: %v", payload.ParentUID)
 	}
 }
 

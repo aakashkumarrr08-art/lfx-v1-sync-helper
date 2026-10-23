@@ -346,6 +346,13 @@ func syncCommitteeCreateToV1(ctx context.Context, committeeUID, projectSFID stri
 	}
 
 	payload := projectServiceCommitteeCreate{Name: name}
+	parentSFID, err := resolveV2CommitteeParentSFID(ctx, projectSFID, data, false)
+	if err != nil {
+		return err // Parent must exist in v1 before its child can be created.
+	}
+	if parentSFID != nil {
+		payload.CommitteeID = *parentSFID
+	}
 	category, _ := data["category"].(string)
 	mapped := mapV2CategoryToV1(category)
 	log.With("v2_category", category, "v1_category", mapped).InfoContext(ctx, "mapping v2 committee category to v1")
@@ -429,6 +436,11 @@ func syncCommitteeUpdateToV1(ctx context.Context, committeeUID, projectSFID, com
 	}
 
 	payload := mapV2DataToV1CommitteeUpdatePayload(data)
+	parentSFID, err := resolveV2CommitteeParentSFID(ctx, projectSFID, data, isFullCommitteeIndexerSnapshot(data))
+	if err != nil {
+		return err
+	}
+	payload.CommitteeID = parentSFID
 	if err := updateV1Committee(ctx, projectSFID, committeeSFID, payload); err != nil {
 		log.With(errKey, err).ErrorContext(ctx, "failed to update committee in v1")
 		return err // transient: trigger redeliver
@@ -438,31 +450,44 @@ func syncCommitteeUpdateToV1(ctx context.Context, committeeUID, projectSFID, com
 	return nil
 }
 
+// resolveV2CommitteeParentSFID maps a parent UID to the v1 project-service
+// CommitteeID. In a full snapshot, omission of parent_uid means v2 currently
+// has no parent (the model uses omitempty), so v1 is cleared; partial legacy
+// events must not clear it. Historical disagreements require reconciliation
+// before deploying this writer: the snapshot alone cannot tell whether an
+// absent v2 parent was an intentional edit or an old sync omission.
+func resolveV2CommitteeParentSFID(ctx context.Context, projectSFID string, data map[string]any, fullSnapshot bool) (*string, error) {
+	value, present := data["parent_uid"]
+	if !present && !fullSnapshot {
+		return nil, nil
+	}
+	parentUID, ok := value.(string)
+	if present && value != nil && !ok {
+		return nil, fmt.Errorf("invalid v2 parent committee UID type %T", value)
+	}
+	if strings.TrimSpace(parentUID) == "" {
+		clearParent := "NONE" // v1 PATCH addIfNotEmptyNA maps NONE to an empty committee_id.
+		return &clearParent, nil
+	}
+	entry, err := getMappingEntryWithRetry(ctx, "committee.uid."+parentUID)
+	if err != nil {
+		return nil, fmt.Errorf("resolving v1 parent committee for UID %s: %w", parentUID, err)
+	}
+	if isTombstonedMapping(entry.Value) {
+		return nil, fmt.Errorf("v1 parent committee mapping is tombstoned for UID %s", parentUID)
+	}
+	parentProjectSFID, parentCommitteeSFID, ok := splitTwoParts(string(entry.Value))
+	if !ok || parentCommitteeSFID == "" || parentProjectSFID != projectSFID {
+		return nil, fmt.Errorf("v1 parent committee mapping for UID %s is invalid or belongs to a different project", parentUID)
+	}
+	return &parentCommitteeSFID, nil
+}
+
 // mapV2DataToV1CommitteeUpdatePayload preserves the distinction between an
 // absent field and an explicitly empty value in the indexer event.
 func mapV2DataToV1CommitteeUpdatePayload(data map[string]any) projectServiceCommitteeUpdate {
 	payload := projectServiceCommitteeUpdate{}
-	// Committee-service v0.4.26 publishes the entire CommitteeBase on updates,
-	// but omitempty drops cleared optional fields before they reach the indexer.
-	// Require both identity and non-optional metadata from that contract before
-	// inferring a clear from absence; do not clear fields on partial/legacy bodies.
-	uid, _ := data["uid"].(string)
-	projectUID, _ := data["project_uid"].(string)
-	_, hasName := data["name"].(string)
-	_, hasCategory := data["category"].(string)
-	createdAt, _ := data["created_at"].(string)
-	updatedAt, _ := data["updated_at"].(string)
-	_, hasEnableVoting := data["enable_voting"].(bool)
-	_, hasSSOGroupEnabled := data["sso_group_enabled"].(bool)
-	_, hasRequiresReview := data["requires_review"].(bool)
-	_, hasPublic := data["public"].(bool)
-	_, hasTotalMembers := data["total_members"].(float64)
-	_, hasTotalVotingRepos := data["total_voting_repos"].(float64)
-	_, hasMailingList := data["has_mailing_list"].(bool)
-	fullSnapshot := uid != "" && projectUID != "" && hasName && hasCategory &&
-		createdAt != "" && updatedAt != "" && hasEnableVoting &&
-		hasSSOGroupEnabled && hasRequiresReview && hasPublic &&
-		hasTotalMembers && hasTotalVotingRepos && hasMailingList
+	fullSnapshot := isFullCommitteeIndexerSnapshot(data)
 	name, _ := data["name"].(string)
 	if name != "" {
 		payload.Name = &name
@@ -499,12 +524,35 @@ func mapV2DataToV1CommitteeUpdatePayload(data map[string]any) projectServiceComm
 	} else if fullSnapshot {
 		payload.ChatChannel = new(string)
 	}
-	// This is a generated v2 identifier, not a user-clearable field. Never
-	// overwrite the v1 write-back with an empty name, even in a full snapshot.
 	if ssoGroupName, ok := data["sso_group_name"].(string); ok && ssoGroupName != "" {
+		// Generated v2 identifier, not user-clearable. Never write back an empty name.
 		payload.SSOGroupName = &ssoGroupName
 	}
 	return payload
+}
+
+func isFullCommitteeIndexerSnapshot(data map[string]any) bool {
+	// Committee-service v0.4.26 publishes the entire CommitteeBase on updates,
+	// but omitempty drops cleared optional fields before they reach the indexer.
+	// Require both identity and non-optional metadata from that contract before
+	// inferring a clear from absence; do not clear fields on partial/legacy bodies.
+	uid, _ := data["uid"].(string)
+	projectUID, _ := data["project_uid"].(string)
+	_, hasName := data["name"].(string)
+	_, hasCategory := data["category"].(string)
+	createdAt, _ := data["created_at"].(string)
+	updatedAt, _ := data["updated_at"].(string)
+	_, hasEnableVoting := data["enable_voting"].(bool)
+	_, hasSSOGroupEnabled := data["sso_group_enabled"].(bool)
+	_, hasRequiresReview := data["requires_review"].(bool)
+	_, hasPublic := data["public"].(bool)
+	_, hasTotalMembers := data["total_members"].(float64)
+	_, hasTotalVotingRepos := data["total_voting_repos"].(float64)
+	_, hasMailingList := data["has_mailing_list"].(bool)
+	return uid != "" && projectUID != "" && hasName && hasCategory &&
+		createdAt != "" && updatedAt != "" && hasEnableVoting &&
+		hasSSOGroupEnabled && hasRequiresReview && hasPublic &&
+		hasTotalMembers && hasTotalVotingRepos && hasMailingList
 }
 
 // syncCommitteeDeleteToV1 deletes a v1 committee that was deleted in v2.

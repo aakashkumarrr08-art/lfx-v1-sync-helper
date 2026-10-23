@@ -388,7 +388,10 @@ Re-emits v1 `salesforce-project__c` rows that have no live `project.sfid.*` v1-m
 
 Re-emits v1 `platform-collaboration__c` rows that have no live `committee.sfid.*` v1-mappings entry. Mechanism: re-**PUT** the existing `v1-objects` value; no create logic is duplicated here — the running deployment's durable KV consumer (`handleKVPut` → `handleCommitteeUpdate`) does the actual create.
 
-**Why no depth ordering is needed here** (unlike `--backfill-projects`): `handleCommitteeUpdate`'s only create-path dependency is the committee's parent project (`project_name__c` → `project.sfid.*` mapping) — committees do not depend on other committees. `handleCommitteeUpdate` unconditionally returns `false` (ACK, no redelivery) on a missing parent-project mapping, which is the same permanent-drop bug pattern as projects, but with a single dependency level rather than a project's parent-project/legal-parent pair. This flag is meant to run *after* `--backfill-projects` has been run and settled, so candidates are expected to already have a live parent mapping; a candidate whose parent is still unmapped is reported via `skipped_parent_unmapped`, not resolved level by level.
+**Hierarchy limitation:** This command only checks that the owning project (`project_name__c` → `project.sfid.*`) is mapped; it does **not** depth-order committees by their `committee_id` parent.
+Live committee creation also requires a mapped parent committee, so a child emitted before its parent is skipped (ACK, no redelivery).
+Do not use this command to repair parent links on mapped committees or assume it can create an unmapped hierarchy in one pass.
+`scripts/detect_committee_parent_drift.py` compares exported v1/v2/mapping snapshots without writing either system; conflicts require an explicit source-of-truth decision before reconciliation.
 
 - **Candidate source**: `ScanSubjectData` on `KV_v1-objects` (`$KV.v1-objects.platform-collaboration__c.*`) minus live and tombstoned `committee.sfid.*` mappings (`KV_v1-mappings`), further filtered to candidates whose parent `project.sfid.<project_name__c>` mapping is already live.
 - **Pre-filters** mirror `handleKVPut`'s exact order (empty value, decode failure, soft-delete, `shouldSkipSync`, missing `mailing_list__c`/`project_name__c`) so the pass never counts or emits a row the live consumer would drop.

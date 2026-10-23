@@ -520,6 +520,11 @@ func mapV1DataToCommitteeCreatePayload(ctx context.Context, v1Data map[string]an
 		Name:       name,
 		ProjectUID: projectUID,
 	}
+	parentUID, err := resolveV1CommitteeParentUID(ctx, v1Data)
+	if err != nil {
+		return nil, err
+	}
+	payload.ParentUID = parentUID
 
 	// Map optional fields.
 	if desc, ok := v1Data["description__c"].(string); ok && desc != "" {
@@ -623,9 +628,76 @@ func mapV1DataToCommitteeUpdateBasePayload(ctx context.Context, committeeUID str
 		ProjectUID: projectUID,
 	}
 	seedCommitteeUpdateFromCurrentBase(payload, currentBase)
+	if _, present := v1Data["committee_id"]; present {
+		parentUID, err := resolveV1CommitteeParentUID(ctx, v1Data)
+		if err != nil {
+			// An existing child may arrive before its new parent. Unlike an
+			// unmapped create, ACKing this update would lose both the move
+			// and any unrelated edits until the next v1 write.
+			if errors.Is(err, ErrKeyNotFound) {
+				// wrapTransientStoreErr deliberately leaves ErrKeyNotFound
+				// unwrapped elsewhere; this dependency miss is retryable.
+				return nil, &errTransientStore{err: err}
+			}
+			return nil, err
+		}
+		payload.ParentUID = parentUID
+	}
 	overlayV1CommitteeUpdatePayload(ctx, payload, v1Data, name)
 
 	return payload, nil
+}
+
+// resolveV1CommitteeParentUID translates platform.collaboration__c.committee_id
+// (the parent committee SFID) to a v2 UID. A present but empty/null value clears
+// the parent; a missing field leaves an existing parent's value untouched on update.
+func resolveV1CommitteeParentUID(ctx context.Context, v1Data map[string]any) (*string, error) {
+	var parentSFID string
+	switch value := v1Data["committee_id"].(type) {
+	case string:
+		parentSFID = value
+	case nil:
+		return nil, nil
+	default:
+		return nil, fmt.Errorf("invalid parent committee SFID type %T", value)
+	}
+	parentSFID = strings.TrimSpace(parentSFID)
+	if parentSFID == "" {
+		return nil, nil
+	}
+	childSFID, _ := v1Data["sfid"].(string)
+	if parentSFID == childSFID {
+		return nil, fmt.Errorf("committee %s cannot be its own parent", childSFID)
+	}
+	entry, err := mappingStore.Get(ctx, "committee.sfid."+parentSFID)
+	switch {
+	case err == nil:
+		if isTombstonedMapping(entry.Value) || len(entry.Value) == 0 {
+			return nil, fmt.Errorf("parent committee mapping is tombstoned or empty for SFID %s", parentSFID)
+		}
+		uid := string(entry.Value)
+		reverse, reverseErr := mappingStore.Get(ctx, "committee.uid."+uid)
+		switch {
+		case reverseErr == nil:
+			if isTombstonedMapping(reverse.Value) {
+				return nil, fmt.Errorf("reverse parent committee mapping is tombstoned for UID %s", uid)
+			}
+			parentProjectSFID, mappedParentSFID, valid := splitTwoParts(string(reverse.Value))
+			childProjectSFID, _ := v1Data["project_name__c"].(string)
+			if !valid || parentProjectSFID != childProjectSFID || mappedParentSFID != parentSFID {
+				return nil, fmt.Errorf("parent committee %s has an inconsistent mapping or belongs to another project", parentSFID)
+			}
+		case errors.Is(reverseErr, ErrKeyNotFound):
+			return nil, fmt.Errorf("reverse parent committee mapping not yet available for UID %s: %w", uid, reverseErr)
+		default:
+			return nil, wrapTransientStoreErr(fmt.Errorf("resolving reverse parent committee mapping for UID %s: %w", uid, reverseErr))
+		}
+		return &uid, nil
+	case errors.Is(err, ErrKeyNotFound):
+		return nil, fmt.Errorf("parent committee not yet mapped for SFID %s: %w", parentSFID, err)
+	default:
+		return nil, wrapTransientStoreErr(fmt.Errorf("resolving parent committee UID for SFID %s: %w", parentSFID, err))
+	}
 }
 
 // seedCommitteeUpdateFromCurrentBase seeds sync-managed fields on payload from
@@ -647,6 +719,7 @@ func seedCommitteeUpdateFromCurrentBase(payload *committeeservice.UpdateCommitte
 	payload.EnableVoting = currentBase.EnableVoting
 	payload.SsoGroupEnabled = currentBase.SsoGroupEnabled
 	payload.Public = currentBase.Public
+	payload.ParentUID = currentBase.ParentUID
 }
 
 // overlayV1CommitteeUpdatePayload overlays V1 values on top of payload for every

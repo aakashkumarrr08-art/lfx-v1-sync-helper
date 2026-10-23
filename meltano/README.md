@@ -34,6 +34,24 @@ cd meltano
 uv run meltano dragon
 ```
 
+Install the plugins as the release image does (no source credentials needed for
+installation):
+
+```bash
+uv run meltano install tap-postgres target-nats-kv --parallelism=1
+UV_OVERRIDE="$PWD/uv-overrides.txt" uv run meltano install tap-dynamodb --parallelism=1
+.meltano/extractors/tap-postgres/venv/bin/tap-postgres --help
+.meltano/extractors/tap-dynamodb/venv/bin/tap-dynamodb --help
+```
+
+`uv-overrides.txt` selects a Singer SDK version **only for tap-dynamodb** that
+supports the repository's
+`urllib3>=2.8.0` security floor. The upstream tap-dynamodb 0.5.0 still pins
+`singer-sdk~=0.41.0`, which requires `urllib3<2`; remove the override only
+after that upstream requirement is updated and the image build passes without it.
+tap-postgres needs its own, newer Singer SDK and must be installed without
+the override.
+
 ## Usage
 
 ### Copy dev v1 DynamoDB data

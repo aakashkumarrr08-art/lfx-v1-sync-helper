@@ -124,12 +124,13 @@ func committeeBaseFromUpdatePayload(uid *string, payload *committeeservice.Updat
 		EnableVoting:    payload.EnableVoting,
 		SsoGroupEnabled: payload.SsoGroupEnabled,
 		Public:          payload.Public,
+		ParentUID:       payload.ParentUID,
 	}
 }
 
 // committeeBasesEqual compares two CommitteeBaseWithReadonlyAttributes objects across
 // every field the V1→V2 sync writes. Fields not managed by the sync (e.g. RequiresReview,
-// ParentUID, JoinMode, Repository, Scope, Deliverables, KeyDates, Calendar) are ignored
+// JoinMode, Repository, Scope, Deliverables, KeyDates, Calendar) are ignored
 // so that admin edits made in V2 do not force redundant updates.
 func committeeBasesEqual(a, b *committeeservice.CommitteeBaseWithReadonlyAttributes) bool {
 	return stringPtrToString(a.Name) == stringPtrToString(b.Name) &&
@@ -140,6 +141,7 @@ func committeeBasesEqual(a, b *committeeservice.CommitteeBaseWithReadonlyAttribu
 		stringPtrToString(a.MailingList) == stringPtrToString(b.MailingList) &&
 		stringPtrToString(a.ChatChannel) == stringPtrToString(b.ChatChannel) &&
 		stringPtrToString(a.DisplayName) == stringPtrToString(b.DisplayName) &&
+		stringPtrToString(a.ParentUID) == stringPtrToString(b.ParentUID) &&
 		a.EnableVoting == b.EnableVoting &&
 		a.SsoGroupEnabled == b.SsoGroupEnabled &&
 		a.Public == b.Public
