@@ -4,16 +4,19 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/auth0/go-auth0"
 	"github.com/auth0/go-auth0/management"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 func TestNormalizeUserIdentifier(t *testing.T) {
@@ -258,10 +261,12 @@ func TestHandleMergedUserDeleteScrub(t *testing.T) {
 	origLogger := logger
 	origPublish := publishUserDeletedEventFn
 	origEmail := getPrimaryEmailForUserFn
+	origUsername := getDeletedUserUsernameFn
 	t.Cleanup(func() {
 		logger = origLogger
 		publishUserDeletedEventFn = origPublish
 		getPrimaryEmailForUserFn = origEmail
+		getDeletedUserUsernameFn = origUsername
 	})
 	logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 
@@ -273,9 +278,14 @@ func TestHandleMergedUserDeleteScrub(t *testing.T) {
 	tests := []struct {
 		name          string
 		v1Data        map[string]any
+		fallbackName  string
+		lookupErr     error
 		emailResult   string
 		emailErr      error
+		publishErr    error
+		wantLookup    bool
 		wantPublished bool
+		wantRetry     bool
 		wantUsername  string
 		wantEmail     string
 	}{
@@ -310,21 +320,76 @@ func TestHandleMergedUserDeleteScrub(t *testing.T) {
 			wantPublished: false,
 		},
 		{
-			name: "no username → no publish",
+			name: "explicitly blank username does not fall back to a potentially newer DB value",
 			v1Data: map[string]any{
-				"sfid": userSfid,
+				"sfid":        userSfid,
+				"username__c": "",
 			},
 			wantPublished: false,
 		},
 		{
-			name:          "nil v1Data (hard KV delete) → no publish",
-			v1Data:        nil,
+			name: "no username → no publish",
+			v1Data: map[string]any{
+				"sfid": userSfid,
+			},
+			wantLookup:    true,
 			wantPublished: false,
+		},
+		{
+			name:          "soft delete recovers username from exact SFID when payload omits it",
+			v1Data:        map[string]any{},
+			fallbackName:  username,
+			emailResult:   "deleted@example.com",
+			wantLookup:    true,
+			wantPublished: true,
+			wantUsername:  username,
+			wantEmail:     "deleted@example.com",
+		},
+		{
+			name:          "hard KV delete recovers username by exact SFID",
+			v1Data:        nil,
+			fallbackName:  " Alice ",
+			emailResult:   "deleted@example.com",
+			wantLookup:    true,
+			wantPublished: true,
+			wantUsername:  username,
+			wantEmail:     "deleted@example.com",
+		},
+		{
+			name:          "hard KV delete with unavailable prior username → no publish",
+			v1Data:        nil,
+			wantLookup:    true,
+			wantPublished: false,
+		},
+		{
+			name:       "hard KV delete username lookup error → retry",
+			v1Data:     nil,
+			lookupErr:  errors.New("db unavailable"),
+			wantLookup: true,
+			wantRetry:  true,
+		},
+		{
+			name:          "event publication error → retry",
+			v1Data:        map[string]any{"username__c": username},
+			emailResult:   "deleted@example.com",
+			publishErr:    errors.New("nats unavailable"),
+			wantPublished: true,
+			wantRetry:     true,
+			wantUsername:  username,
+			wantEmail:     "deleted@example.com",
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			usernameLookupCalled := false
+			getDeletedUserUsernameFn = func(_ context.Context, gotSfid string) (string, error) {
+				usernameLookupCalled = true
+				if gotSfid != userSfid {
+					t.Errorf("getDeletedUserUsernameFn called with sfid %q, want %q", gotSfid, userSfid)
+				}
+				return tc.fallbackName, tc.lookupErr
+			}
 			getPrimaryEmailForUserFn = func(_ context.Context, gotSfid string) (string, error) {
 				if gotSfid != userSfid {
 					t.Errorf("getPrimaryEmailForUserFn called with sfid %q, want %q", gotSfid, userSfid)
@@ -336,16 +401,20 @@ func TestHandleMergedUserDeleteScrub(t *testing.T) {
 			var publishedEmail string
 			var publishCalled bool
 
-			publishUserDeletedEventFn = func(_ context.Context, _, u, e string) {
+			publishUserDeletedEventFn = func(_ context.Context, _, u, e string) error {
 				publishCalled = true
 				publishedUsername = u
 				publishedEmail = e
+				return tc.publishErr
 			}
 
 			got := handleMergedUserDelete(context.Background(), "test-key", userSfid, tc.v1Data)
 
-			if got {
-				t.Errorf("handleMergedUserDelete() = true, want false")
+			if got != tc.wantRetry {
+				t.Errorf("handleMergedUserDelete() = %v, want %v", got, tc.wantRetry)
+			}
+			if usernameLookupCalled != tc.wantLookup {
+				t.Errorf("username lookup called = %v, want %v", usernameLookupCalled, tc.wantLookup)
 			}
 			if publishCalled != tc.wantPublished {
 				t.Errorf("publishCalled = %v, want %v", publishCalled, tc.wantPublished)
@@ -355,6 +424,166 @@ func TestHandleMergedUserDeleteScrub(t *testing.T) {
 			}
 			if tc.wantPublished && publishedEmail != tc.wantEmail {
 				t.Errorf("published email = %q, want %q", publishedEmail, tc.wantEmail)
+			}
+		})
+	}
+}
+
+func TestHandleMergedUserDeleteMissingUsernameLookupMiss(t *testing.T) {
+	origLogger := logger
+	origPublish := publishUserDeletedEventFn
+	origEmail := getPrimaryEmailForUserFn
+	origUsername := getDeletedUserUsernameFn
+	var logOutput bytes.Buffer
+	logger = slog.New(slog.NewJSONHandler(&logOutput, nil))
+	getDeletedUserUsernameFn = func(_ context.Context, sfid string) (string, error) {
+		if sfid != "003ABC" {
+			t.Errorf("username lookup SFID = %q, want 003ABC", sfid)
+		}
+		return "", nil
+	}
+	getPrimaryEmailForUserFn = func(context.Context, string) (string, error) {
+		t.Error("primary email lookup should not run without a username")
+		return "", nil
+	}
+	publishCalls := 0
+	publishUserDeletedEventFn = func(context.Context, string, string, string) error {
+		publishCalls++
+		return nil
+	}
+	t.Cleanup(func() {
+		logger = origLogger
+		publishUserDeletedEventFn = origPublish
+		getPrimaryEmailForUserFn = origEmail
+		getDeletedUserUsernameFn = origUsername
+	})
+
+	retry := handleMergedUserDelete(context.Background(), "test-key", "003ABC", map[string]any{
+		"sfid": "003ABC",
+	})
+	if retry {
+		t.Fatal("successful empty username lookup should not request retry")
+	}
+	if publishCalls != 0 {
+		t.Fatalf("published %d deletion events without a recovered username, want 0", publishCalls)
+	}
+
+	logged := logOutput.String()
+	if !strings.Contains(logged, "merged_user delete cleanup skipped because username could not be recovered") {
+		t.Fatalf("expected cleanup-skipped warning, got log %q", logged)
+	}
+	if !strings.Contains(logged, `"user_sfid":"003ABC"`) {
+		t.Errorf("expected warning to identify the user SFID, got log %q", logged)
+	}
+	for _, pii := range []string{"alice", "deleted@example.com", `"username"`, `"email"`} {
+		if strings.Contains(logged, pii) {
+			t.Errorf("warning log contains PII marker %q: %s", pii, logged)
+		}
+	}
+}
+
+func TestKVHandlerMergedUserHardDeleteAndPurge(t *testing.T) {
+	origLogger := logger
+	origPublish := publishUserDeletedEventFn
+	origEmail := getPrimaryEmailForUserFn
+	origUsername := getDeletedUserUsernameFn
+	t.Cleanup(func() {
+		logger = origLogger
+		publishUserDeletedEventFn = origPublish
+		getPrimaryEmailForUserFn = origEmail
+		getDeletedUserUsernameFn = origUsername
+	})
+	logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	for _, operation := range []jetstream.KeyValueOp{jetstream.KeyValueDelete, jetstream.KeyValuePurge} {
+		t.Run(operation.String(), func(t *testing.T) {
+			published := 0
+			getDeletedUserUsernameFn = func(_ context.Context, sfid string) (string, error) {
+				if sfid != "003ABC" {
+					t.Errorf("username lookup SFID = %q, want 003ABC", sfid)
+				}
+				return "alice", nil
+			}
+			getPrimaryEmailForUserFn = func(context.Context, string) (string, error) {
+				return "", nil
+			}
+			publishUserDeletedEventFn = func(_ context.Context, _, username, _ string) error {
+				published++
+				if username != "alice" {
+					t.Errorf("published username = %q, want alice", username)
+				}
+				return nil
+			}
+
+			retry := kvHandler(&kvEntry{
+				key:       "salesforce-merged_user.003ABC",
+				operation: operation,
+			})
+			if retry {
+				t.Fatal("kvHandler() requested retry after successful publish")
+			}
+			if published != 1 {
+				t.Fatalf("published %d user-deleted events, want 1", published)
+			}
+		})
+	}
+}
+
+type mergedUserDeleteDeliveryMsg struct {
+	*fakeMsg
+}
+
+func (m *mergedUserDeleteDeliveryMsg) Metadata() (*jetstream.MsgMetadata, error) {
+	return &jetstream.MsgMetadata{NumDelivered: 1}, nil
+}
+
+func TestKVMessageHandlerMergedUserDeleteAcknowledgment(t *testing.T) {
+	origLogger := logger
+	origPublish := publishUserDeletedEventFn
+	origEmail := getPrimaryEmailForUserFn
+	origUsername := getDeletedUserUsernameFn
+	t.Cleanup(func() {
+		logger = origLogger
+		publishUserDeletedEventFn = origPublish
+		getPrimaryEmailForUserFn = origEmail
+		getDeletedUserUsernameFn = origUsername
+	})
+	logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	getPrimaryEmailForUserFn = func(context.Context, string) (string, error) {
+		return "", nil
+	}
+
+	for _, tc := range []struct {
+		name       string
+		publishErr error
+		wantAck    bool
+		wantNak    bool
+	}{
+		{name: "successful publication ACKs", wantAck: true},
+		{name: "publication failure NAKs", publishErr: errors.New("nats unavailable"), wantNak: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			getDeletedUserUsernameFn = func(context.Context, string) (string, error) {
+				t.Fatal("database lookup should not run when tombstone has username")
+				return "", nil
+			}
+			publishUserDeletedEventFn = func(context.Context, string, string, string) error {
+				return tc.publishErr
+			}
+			msg := &mergedUserDeleteDeliveryMsg{
+				fakeMsg: &fakeMsg{
+					subject: "$KV.v1-objects.salesforce-merged_user.003ABC",
+					data:    []byte(`{"sfid":"003ABC","username__c":"alice","_sdc_deleted_at":"2024-01-01T00:00:00Z"}`),
+				},
+			}
+
+			kvMessageHandler(msg)
+
+			if msg.acked != tc.wantAck {
+				t.Errorf("acked = %v, want %v", msg.acked, tc.wantAck)
+			}
+			if msg.nacked != tc.wantNak {
+				t.Errorf("nacked = %v, want %v", msg.nacked, tc.wantNak)
 			}
 		})
 	}
@@ -372,7 +601,7 @@ func TestPublishUserDeletedEvent(t *testing.T) {
 	t.Run("publishes normalized payload on subject", func(t *testing.T) {
 		var gotSubject string
 		var gotPayload userDeletedEvent
-		natsPublishBytesFn = func(subject string, data []byte) error {
+		natsPublishBytesFn = func(_ context.Context, subject string, data []byte) error {
 			gotSubject = subject
 			if err := json.Unmarshal(data, &gotPayload); err != nil {
 				t.Fatalf("unmarshal payload: %v", err)
@@ -380,7 +609,9 @@ func TestPublishUserDeletedEvent(t *testing.T) {
 			return nil
 		}
 
-		publishUserDeletedEvent(context.Background(), "test-key", "alice", "alice@example.com")
+		if err := publishUserDeletedEvent(context.Background(), "test-key", "alice", "alice@example.com"); err != nil {
+			t.Fatalf("publishUserDeletedEvent() error = %v", err)
+		}
 
 		if gotSubject != v1SyncHelperUserDeletedSubject {
 			t.Fatalf("subject = %q, want %q", gotSubject, v1SyncHelperUserDeletedSubject)
@@ -393,11 +624,13 @@ func TestPublishUserDeletedEvent(t *testing.T) {
 		}
 	})
 
-	t.Run("publish error is swallowed", func(_ *testing.T) {
-		natsPublishBytesFn = func(_ string, _ []byte) error {
+	t.Run("publish error is returned", func(t *testing.T) {
+		natsPublishBytesFn = func(_ context.Context, _ string, _ []byte) error {
 			return errors.New("nats unavailable")
 		}
-		publishUserDeletedEvent(context.Background(), "test-key", "alice", "")
+		if err := publishUserDeletedEvent(context.Background(), "test-key", "alice", ""); err == nil {
+			t.Fatal("publishUserDeletedEvent() error = nil, want publication failure")
+		}
 	})
 }
 

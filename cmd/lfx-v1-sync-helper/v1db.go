@@ -53,6 +53,12 @@ type mergedUserRow struct {
 	IsDeleted sql.NullBool   `bun:"isdeleted"`
 }
 
+type mergedUserUsernameRow struct {
+	bun.BaseModel `bun:"table:salesforce.merged_user,alias:mu"`
+
+	Username sql.NullString `bun:"username__c"`
+}
+
 // alternateEmailRow maps the columns we need from salesforce.alternate_email__c.
 type alternateEmailRow struct {
 	bun.BaseModel `bun:"table:salesforce.alternate_email__c,alias:ae"`
@@ -178,6 +184,29 @@ func dbLookupMergedUserRowBySFID(ctx context.Context, sfid string) (*mergedUserR
 		return nil, fmt.Errorf("failed to query merged_user by sfid: %w", err)
 	}
 	return row, nil
+}
+
+// dbGetUsernameForDeletedUser looks up username__c by the exact SFID without
+// filtering soft-deleted rows. This recovers the username for a hard KV delete
+// when the source row is still retained; a physically removed row is a safe miss.
+func dbGetUsernameForDeletedUser(ctx context.Context, sfid string) (string, error) {
+	if sfid == "" {
+		return "", nil
+	}
+	row := &mergedUserUsernameRow{}
+	qCtx, cancel := withQueryTimeout(ctx)
+	defer cancel()
+	err := v1DB.NewSelect().Model(row).
+		Where("mu.sfid = ?", sfid).
+		Limit(1).
+		Scan(qCtx)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", fmt.Errorf("failed to query deleted merged_user username: %w", err)
+	}
+	return row.Username.String, nil
 }
 
 // dbResolveUserSFIDByEmail resolves a v1 user SFID by any of the user's

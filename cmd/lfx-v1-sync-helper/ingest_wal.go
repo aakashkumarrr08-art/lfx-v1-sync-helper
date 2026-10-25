@@ -73,15 +73,13 @@ func (w *WALEvent) pkColumn() string {
 // walDeleteFallbackTables lists tables where handleWALDelete should build a
 // tombstone directly from a DELETE event's DataOld when no v1-objects KV
 // entry already exists for the row, instead of silently skipping the
-// delete. This matters for tables that (unlike Salesforce __c objects) are
-// not seeded by the Meltano backfill pipeline: a row that existed before the
-// table was added to the WAL filter, and is later deleted without ever
-// having triggered an INSERT/UPDATE WAL event first, would otherwise have no
-// KV entry to update, and the delete would be lost forever rather than
-// merely delayed. Relying on DataOld here requires REPLICA IDENTITY FULL on
-// the source table so the deleted row's non-PK columns are present.
+// delete. This is needed both for tables without a Meltano seed and for
+// merged_user, whose DataOld may be the only copy of username__c after the
+// source row is physically removed. The merged-user delete handler also uses
+// its exact-SFID database lookup when DataOld does not contain a username.
 var walDeleteFallbackTables = map[string]bool{
 	"user_skills": true,
+	"merged_user": true,
 }
 
 // walTimestamplessTables lists tables that never carry a "systemmodstamp" or
@@ -365,6 +363,17 @@ func handleWALDelete(ctx context.Context, walEvent *WALEvent) bool {
 				logger.With(errKey, unmarshalErr, "msgpack_error", msgpackErr, "key", key).ErrorContext(ctx, "failed to unmarshal existing KV entry data for delete")
 				return false
 			}
+		}
+	}
+
+	// WAL DataOld represents the row immediately before deletion and is more
+	// authoritative than a potentially stale KV snapshot for merged_user's
+	// username. Only overlay this field when the producer supplied it; if it
+	// is absent, retain the KV value and let the delete handler's exact-SFID
+	// lookup provide the final fallback.
+	if walEvent.Table == "merged_user" {
+		if oldUsername, exists := walEvent.DataOld["username__c"]; exists {
+			existingData["username__c"] = oldUsername
 		}
 	}
 

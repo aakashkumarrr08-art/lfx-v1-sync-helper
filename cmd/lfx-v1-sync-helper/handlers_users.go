@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -23,6 +24,8 @@ const (
 // handler always ACKs/NACKs before server-side redelivery. The 10s slack
 // covers rate-limiter waits, logging, and the ACK/NACK roundtrip.
 const auth0CallTimeout = 20 * time.Second
+
+const userDeletedEventPublishTimeout = 10 * time.Second
 
 // syncProfileToAuth0Fn is the function handleMergedUserUpdate calls to push
 // a profile to Auth0. Swappable in tests; production leaves it pointing at
@@ -43,6 +46,7 @@ var (
 var (
 	publishUserDeletedEventFn = publishUserDeletedEvent
 	getPrimaryEmailForUserFn  = dbGetLastKnownPrimaryEmailForUser
+	getDeletedUserUsernameFn  = dbGetUsernameForDeletedUser
 )
 
 // isSoleQualifyingAlternateEmailFn is injectable for tests.
@@ -91,19 +95,39 @@ func handleMergedUserUpdate(ctx context.Context, key string, v1Data map[string]a
 // publishing a user-deleted event so v2 committee data is scrubbed of the
 // username. Lookups query the v1 platform database live, so there are no
 // secondary indexes to clean up.
-// Soft deletes and hard KV deletes both arrive here; v1Data is nil for a hard KV delete.
+// Soft deletes and hard KV deletes both arrive here. For a hard KV delete,
+// recover the username from the v1 database by the exact user SFID.
 // Returns true if the operation should be retried, false otherwise.
 func handleMergedUserDelete(ctx context.Context, key, userSfid string, v1Data map[string]any) bool {
+	var username string
 	if v1Data == nil {
-		// Hard KV delete — the payload is gone so we cannot resolve the
-		// username to publish a scrub event. Soft deletes should always
-		// carry a payload, so log a warning if we see this.
-		logger.With("key", key, "user_sfid", userSfid).
-			WarnContext(ctx, "merged_user hard-deleted with no payload; cannot publish user-deleted event")
-		return false
+		var err error
+		username, err = getDeletedUserUsernameFn(ctx, userSfid)
+		if err != nil {
+			logger.With(errKey, err, "key", key, "user_sfid", userSfid).
+				WarnContext(ctx, "failed to recover username for hard-deleted merged_user; retrying")
+			return true
+		}
+	} else {
+		if value, exists := v1Data["username__c"]; exists {
+			// An explicitly present blank value is authoritative for this
+			// delete; do not replace it with a potentially newer DB value.
+			username, _ = value.(string)
+		} else {
+			var err error
+			username, err = getDeletedUserUsernameFn(ctx, userSfid)
+			if err != nil {
+				logger.With(errKey, err, "key", key, "user_sfid", userSfid).
+					WarnContext(ctx, "failed to recover username for deleted merged_user; retrying")
+				return true
+			}
+			if normalizeUserIdentifier(username) == "" {
+				logger.With("key", key, "user_sfid", userSfid).
+					WarnContext(ctx, "merged_user delete cleanup skipped because username could not be recovered")
+			}
+		}
 	}
 
-	username, _ := v1Data["username__c"].(string)
 	if normalizedUsername := normalizeUserIdentifier(username); normalizedUsername != "" {
 		// Best-effort primary email lookup: the alternate email rows may
 		// already be soft-deleted, so this queries without liveness filters.
@@ -115,15 +139,22 @@ func handleMergedUserDelete(ctx context.Context, key, userSfid string, v1Data ma
 			logger.With("key", key, "user_sfid", userSfid).
 				DebugContext(ctx, "no primary email found for deleted user; publishing user-deleted event without email")
 		}
-		publishUserDeletedEventFn(ctx, key, normalizedUsername, email)
+		if err := publishUserDeletedEventFn(ctx, key, normalizedUsername, email); err != nil {
+			logger.With(errKey, err, "key", key, "user_sfid", userSfid).
+				WarnContext(ctx, "failed to publish user-deleted event; retrying KV message")
+			return true
+		}
+	} else if v1Data == nil {
+		logger.With("key", key, "user_sfid", userSfid).
+			WarnContext(ctx, "merged_user hard-deleted but no username is available; skipping user-deleted event")
 	}
 
 	return false
 }
 
 // userDeletedEvent is the payload published to "lfx.v1-sync-helper.user.deleted" when a
-// merged user is soft-deleted. Username is the normalized LFID; Email is the deleted
-// account's primary email when available so downstream scrubbers can distinguish LFID reuse.
+// merged user is deleted. Username is the normalized LFID; Email is the deleted account's
+// primary email when available so downstream scrubbers can distinguish LFID reuse.
 type userDeletedEvent struct {
 	Username string `json:"username"`
 	Email    string `json:"email,omitempty"`
@@ -131,28 +162,30 @@ type userDeletedEvent struct {
 
 const v1SyncHelperUserDeletedSubject = "lfx.v1-sync-helper.user.deleted"
 
-// publishUserDeletedEvent publishes a user-deleted NATS event. Best-effort: publish
-// errors are logged and do not affect the delete handler's return value (the JetStream
-// KV delete is already ACKed). A failed publish can leave username PII in v2 settings
-// until a manual re-sync; scrub subscribers treat the event as idempotent.
-var natsPublishBytesFn = func(subject string, data []byte) error {
-	return natsConn.Publish(subject, data)
+// publishUserDeletedEvent publishes a user-deleted NATS event. Flush confirms
+// the server received the publish before the KV message is ACKed. A timeout
+// can still cause a duplicate on retry if the server received the event but
+// the flush response was lost; the subscriber's scrub operation is idempotent.
+var natsPublishBytesFn = func(ctx context.Context, subject string, data []byte) error {
+	if err := natsConn.Publish(subject, data); err != nil {
+		return err
+	}
+	flushCtx, cancel := context.WithTimeout(ctx, userDeletedEventPublishTimeout)
+	defer cancel()
+	return natsConn.FlushWithContext(flushCtx)
 }
 
-func publishUserDeletedEvent(ctx context.Context, key, username, email string) {
+func publishUserDeletedEvent(ctx context.Context, key, username, email string) error {
 	payload, err := json.Marshal(userDeletedEvent{Username: username, Email: email})
 	if err != nil {
-		logger.With(errKey, err, "key", key).
-			ErrorContext(ctx, "failed to marshal user-deleted event; committee username scrub skipped")
-		return
+		return fmt.Errorf("marshal user-deleted event: %w", err)
 	}
-	if err := natsPublishBytesFn(v1SyncHelperUserDeletedSubject, payload); err != nil {
-		logger.With(errKey, err, "key", key).
-			ErrorContext(ctx, "failed to publish user-deleted event; committee username scrub skipped")
-		return
+	if err := natsPublishBytesFn(ctx, v1SyncHelperUserDeletedSubject, payload); err != nil {
+		return fmt.Errorf("publish user-deleted event: %w", err)
 	}
 	logger.With("key", key).
 		InfoContext(ctx, "published user-deleted event for committee username scrub")
+	return nil
 }
 
 // syncMergedUserProfile calls syncProfileToAuth0Fn synchronously and returns
